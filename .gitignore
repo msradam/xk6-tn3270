@@ -1,0 +1,32 @@
+# Binaries
+k6
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output
+*.out
+screenshots/
+
+# Go workspace
+*.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Internal docs
+ARCHITECTURE.md
+
+# Test dependencies
+simplatform/
