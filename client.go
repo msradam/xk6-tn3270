@@ -195,6 +195,16 @@ func (c *Client) Tab() error {
 	return err
 }
 
+func (c *Client) BackTab() error {
+	_, err := c.sendCommand("BackTab()")
+	return err
+}
+
+func (c *Client) Home() error {
+	_, err := c.sendCommand("Home()")
+	return err
+}
+
 func (c *Client) Clear() error {
 	_, err := c.sendCommand("Clear()")
 	return err
