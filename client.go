@@ -233,7 +233,7 @@ func (c *Client) MoveTo(row, col int) error {
 	if col < 1 || col > 80 {
 		return fmt.Errorf("column must be between 1 and 80, got %d", col)
 	}
-	_, err := c.sendCommand(fmt.Sprintf("MoveCursor(%d,%d)", row, col))
+	_, err := c.sendCommand(fmt.Sprintf("MoveCursor(%d,%d)", row-1, col-1))
 	return err
 }
 
