@@ -212,6 +212,24 @@ func (c *Client) Pa(key int) error {
 	return err
 }
 
+func (c *Client) MoveTo(row, col int) error {
+	if row < 1 || row > 24 {
+		return fmt.Errorf("row must be between 1 and 24, got %d", row)
+	}
+	if col < 1 || col > 80 {
+		return fmt.Errorf("column must be between 1 and 80, got %d", col)
+	}
+	_, err := c.sendCommand(fmt.Sprintf("MoveCursor(%d,%d)", row, col))
+	return err
+}
+
+func (c *Client) StringAt(text string, row, col int) error {
+	if err := c.MoveTo(row, col); err != nil {
+		return err
+	}
+	return c.String(text)
+}
+
 func (c *Client) WaitForField(timeout ...int) error {
 	timeoutSec := 30
 	if len(timeout) > 0 && timeout[0] > 0 {
@@ -222,6 +240,11 @@ func (c *Client) WaitForField(timeout ...int) error {
 }
 
 func (c *Client) WaitForText(text string, timeout ...int) error {
+	_, err := c.WaitForTextAndReturn(text, timeout...)
+	return err
+}
+
+func (c *Client) WaitForTextAndReturn(text string, timeout ...int) (string, error) {
 	timeoutSec := 30
 	if len(timeout) > 0 && timeout[0] > 0 {
 		timeoutSec = timeout[0]
@@ -233,23 +256,23 @@ func (c *Client) WaitForText(text string, timeout ...int) error {
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		default:
 		}
 
 		screen, err := c.GetScreenText()
 		if err != nil {
-			return err
+			return "", err
 		}
 
 		if strings.Contains(screen, text) {
-			return nil
+			return screen, nil
 		}
 
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	return fmt.Errorf("timeout waiting for text: %s", text)
+	return "", fmt.Errorf("timeout waiting for text: %s", text)
 }
 
 func (c *Client) GetScreenText() (string, error) {

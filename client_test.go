@@ -267,3 +267,53 @@ func TestSendCommandWithoutS3270(t *testing.T) {
 		t.Errorf("expected error containing 's3270 not started', got %q", err.Error())
 	}
 }
+
+func TestMoveToValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		row         int
+		col         int
+		expectError string
+	}{
+		{
+			name:        "row too low",
+			row:         0,
+			col:         1,
+			expectError: "row must be between 1 and 24",
+		},
+		{
+			name:        "row too high",
+			row:         25,
+			col:         1,
+			expectError: "row must be between 1 and 24",
+		},
+		{
+			name:        "col too low",
+			row:         1,
+			col:         0,
+			expectError: "column must be between 1 and 80",
+		},
+		{
+			name:        "col too high",
+			row:         1,
+			col:         81,
+			expectError: "column must be between 1 and 80",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{}
+			err := c.MoveTo(tt.row, tt.col)
+
+			if err == nil {
+				t.Errorf("expected error containing %q, got nil", tt.expectError)
+				return
+			}
+
+			if !strings.Contains(err.Error(), tt.expectError) {
+				t.Errorf("expected error containing %q, got %q", tt.expectError, err.Error())
+			}
+		})
+	}
+}
