@@ -103,8 +103,12 @@ func (c *Client) sendCommand(command string) (string, error) {
 		if line == "ok" {
 			break
 		}
-		if strings.HasPrefix(line, "error") {
-			return "", fmt.Errorf("s3270 error: %s", line)
+		if line == "error" || strings.HasPrefix(line, "error ") {
+			errMsg := strings.TrimPrefix(line, "error ")
+			if errMsg == line {
+				errMsg = "unknown error"
+			}
+			return "", fmt.Errorf("s3270 error: %s (command: %s)", errMsg, command)
 		}
 		if strings.HasPrefix(line, "data:") {
 			content := strings.TrimPrefix(line, "data:")
