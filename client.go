@@ -37,8 +37,9 @@ func (c *Client) startS3270() error {
 		return nil
 	}
 
-	ctx := c.vu.Context()
-	c.cmd = exec.CommandContext(ctx, "s3270")
+	// Don't use CommandContext - we manage the lifecycle manually via Disconnect()
+	// Using VU context causes the process to be killed between iterations
+	c.cmd = exec.Command("s3270")
 
 	stdin, err := c.cmd.StdinPipe()
 	if err != nil {
@@ -55,11 +56,6 @@ func (c *Client) startS3270() error {
 	if err := c.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start s3270: %w", err)
 	}
-
-	go func() {
-		<-ctx.Done()
-		c.cleanup()
-	}()
 
 	return nil
 }
