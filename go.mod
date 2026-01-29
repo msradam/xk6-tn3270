@@ -1,6 +1,6 @@
 module github.com/msradam/xk6-tn3270
 
-go 1.25.6
+go 1.25.2
 
 require go.k6.io/k6 v1.5.0
 
