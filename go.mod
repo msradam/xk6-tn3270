@@ -45,3 +45,5 @@ require (
 	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/guregu/null.v3 v3.3.0 // indirect
 )
+
+replace github.com/spf13/afero => github.com/spf13/afero v1.11.0
