@@ -1,11 +1,8 @@
 package tn3270
 
 import (
-	"bufio"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,9 +13,7 @@ import (
 
 type Client struct {
 	vu        modules.VU
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    *bufio.Reader
+	emu       *Emulator
 	mu        sync.Mutex
 	connected bool
 }
@@ -29,92 +24,11 @@ func NewClient(vu modules.VU) *Client {
 	}
 }
 
-func (c *Client) startS3270() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.cmd != nil {
-		return nil
+func (c *Client) checkConnected() error {
+	if c.emu == nil || !c.connected {
+		return fmt.Errorf("not connected")
 	}
-
-	// Don't use CommandContext - we manage the lifecycle manually via Disconnect()
-	// Using VU context causes the process to be killed between iterations
-	c.cmd = exec.Command("s3270")
-
-	stdin, err := c.cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdin pipe: %w", err)
-	}
-	c.stdin = stdin
-
-	stdout, err := c.cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-	c.stdout = bufio.NewReader(stdout)
-
-	if err := c.cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start s3270: %w", err)
-	}
-
 	return nil
-}
-
-func (c *Client) cleanup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.stdin != nil {
-		_ = c.stdin.Close()
-	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-		_ = c.cmd.Wait()
-	}
-	c.cmd = nil
-	c.connected = false
-}
-
-func (c *Client) sendCommand(command string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.cmd == nil {
-		return "", fmt.Errorf("s3270 not started")
-	}
-
-	_, err := fmt.Fprintf(c.stdin, "%s\n", command)
-	if err != nil {
-		return "", fmt.Errorf("failed to send command: %w", err)
-	}
-
-	var result strings.Builder
-	for {
-		line, err := c.stdout.ReadString('\n')
-		if err != nil {
-			return "", fmt.Errorf("failed to read response: %w", err)
-		}
-		line = strings.TrimRight(line, "\r\n")
-
-		if line == "ok" {
-			break
-		}
-		if line == "error" || strings.HasPrefix(line, "error ") {
-			errMsg := strings.TrimPrefix(line, "error ")
-			if errMsg == line {
-				errMsg = "unknown error"
-			}
-			return "", fmt.Errorf("s3270 error: %s (command: %s)", errMsg, command)
-		}
-		if strings.HasPrefix(line, "data:") {
-			content := strings.TrimPrefix(line, "data:")
-			content = strings.TrimPrefix(content, " ")
-			result.WriteString(content)
-			result.WriteString("\n")
-		}
-	}
-
-	return strings.TrimSuffix(result.String(), "\n"), nil
 }
 
 func (c *Client) Connect(host string, port int, timeout ...int) error {
@@ -136,12 +50,14 @@ func (c *Client) Connect(host string, port int, timeout ...int) error {
 		return fmt.Errorf("timeout must be between 1 and 300 seconds, got %d", timeoutSec)
 	}
 
-	if err := c.startS3270(); err != nil {
-		return err
-	}
+	c.mu.Lock()
+	c.emu = NewEmulator()
+	c.mu.Unlock()
 
-	_, err := c.sendCommand(fmt.Sprintf("Connect(%s:%d)", host, port))
-	if err != nil {
+	if err := c.emu.Connect(host, port, time.Duration(timeoutSec)*time.Second); err != nil {
+		c.mu.Lock()
+		c.emu = nil
+		c.mu.Unlock()
 		return fmt.Errorf("failed to connect to %s:%d: %w", host, port, err)
 	}
 
@@ -154,17 +70,18 @@ func (c *Client) Connect(host string, port int, timeout ...int) error {
 
 func (c *Client) Disconnect() error {
 	c.mu.Lock()
-	connected := c.connected
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
-	if !connected {
+	if !c.connected {
 		return nil
 	}
 
-	_, _ = c.sendCommand("Disconnect()")
-	_, _ = c.sendCommand("Quit()")
-	c.cleanup()
+	if c.emu != nil {
+		c.emu.Disconnect()
+	}
 
+	c.connected = false
+	c.emu = nil
 	return nil
 }
 
@@ -172,8 +89,10 @@ func (c *Client) String(text string) error {
 	if len(text) > 1920 {
 		return fmt.Errorf("text exceeds maximum length of 1920 characters")
 	}
-	_, err := c.sendCommand(fmt.Sprintf("String(%q)", text))
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	return c.emu.TypeString(text)
 }
 
 // Type is an alias for String, matching Galasa's API convention.
@@ -182,44 +101,61 @@ func (c *Client) Type(text string) error {
 }
 
 func (c *Client) Enter() error {
-	_, err := c.sendCommand("Enter()")
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	return c.emu.Enter(30 * time.Second)
 }
 
 func (c *Client) Tab() error {
-	_, err := c.sendCommand("Tab()")
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.Tab()
+	return nil
 }
 
 func (c *Client) BackTab() error {
-	_, err := c.sendCommand("BackTab()")
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.BackTab()
+	return nil
 }
 
 func (c *Client) Home() error {
-	_, err := c.sendCommand("Home()")
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.Home()
+	return nil
 }
 
 func (c *Client) Clear() error {
-	_, err := c.sendCommand("Clear()")
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	return c.emu.Clear(30 * time.Second)
 }
 
 func (c *Client) Pf(key int) error {
 	if key < 1 || key > 24 {
-		return fmt.Errorf("PF key must be between 1 and 24, got %d", key)
+		return fmt.Errorf("pf key must be between 1 and 24, got %d", key)
 	}
-	_, err := c.sendCommand(fmt.Sprintf("PF(%d)", key))
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	return c.emu.PF(key, 30*time.Second)
 }
 
 func (c *Client) Pa(key int) error {
 	if key < 1 || key > 3 {
-		return fmt.Errorf("PA key must be between 1 and 3, got %d", key)
+		return fmt.Errorf("pa key must be between 1 and 3, got %d", key)
 	}
-	_, err := c.sendCommand(fmt.Sprintf("PA(%d)", key))
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	return c.emu.PA(key, 30*time.Second)
 }
 
 func (c *Client) MoveTo(row, col int) error {
@@ -229,8 +165,11 @@ func (c *Client) MoveTo(row, col int) error {
 	if col < 1 || col > 80 {
 		return fmt.Errorf("column must be between 1 and 80, got %d", col)
 	}
-	_, err := c.sendCommand(fmt.Sprintf("MoveCursor(%d,%d)", row-1, col-1))
-	return err
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.MoveCursor(row-1, col-1)
+	return nil
 }
 
 func (c *Client) StringAt(text string, row, col int) error {
@@ -241,12 +180,14 @@ func (c *Client) StringAt(text string, row, col int) error {
 }
 
 func (c *Client) WaitForField(timeout ...int) error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
 	timeoutSec := 30
 	if len(timeout) > 0 && timeout[0] > 0 {
 		timeoutSec = timeout[0]
 	}
-	_, err := c.sendCommand(fmt.Sprintf("Wait(%d,InputField)", timeoutSec))
-	return err
+	return c.emu.WaitForField(time.Duration(timeoutSec) * time.Second)
 }
 
 func (c *Client) WaitForText(text string, timeout ...int) error {
@@ -255,6 +196,10 @@ func (c *Client) WaitForText(text string, timeout ...int) error {
 }
 
 func (c *Client) WaitForTextAndReturn(text string, timeout ...int) (string, error) {
+	if err := c.checkConnected(); err != nil {
+		return "", err
+	}
+
 	timeoutSec := 30
 	if len(timeout) > 0 && timeout[0] > 0 {
 		timeoutSec = timeout[0]
@@ -270,11 +215,7 @@ func (c *Client) WaitForTextAndReturn(text string, timeout ...int) (string, erro
 		default:
 		}
 
-		screen, err := c.GetScreenText()
-		if err != nil {
-			return "", err
-		}
-
+		screen := c.emu.GetScreen()
 		if strings.Contains(screen, text) {
 			return screen, nil
 		}
@@ -286,7 +227,10 @@ func (c *Client) WaitForTextAndReturn(text string, timeout ...int) (string, erro
 }
 
 func (c *Client) GetScreenText() (string, error) {
-	return c.sendCommand("Ascii()")
+	if err := c.checkConnected(); err != nil {
+		return "", err
+	}
+	return c.emu.GetScreen(), nil
 }
 
 func (c *Client) ASCII() (string, error) {
@@ -351,7 +295,7 @@ func (c *Client) Screenshot(path string) error {
 
 	dir := filepath.Dir(cleanPath)
 	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return fmt.Errorf("failed to create directory: %w", err)
 		}
 	}

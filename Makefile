@@ -24,5 +24,5 @@ fmt:
 	gofmt -s -w .
 
 check-deps:
-	@which s3270 > /dev/null || (echo "s3270 not found. Install with: brew install x3270" && exit 1)
+	@which xk6 > /dev/null || (echo "xk6 not found. Install with: go install go.k6.io/xk6/cmd/xk6@latest" && exit 1)
 	@echo "All dependencies available"
