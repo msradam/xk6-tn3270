@@ -3,34 +3,20 @@
 [![CI](https://github.com/msradam/xk6-tn3270/actions/workflows/ci.yml/badge.svg)](https://github.com/msradam/xk6-tn3270/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/msradam/xk6-tn3270)](https://goreportcard.com/report/github.com/msradam/xk6-tn3270)
 
-TN3270 terminal emulation support for [k6](https://k6.io/) load testing.
-
-This extension allows you to perform load testing against IBM mainframe applications that use the TN3270 protocol.
+A [k6](https://k6.io/) extension for load testing IBM mainframe applications over the TN3270 protocol.
 
 ## Features
 
-- TN3270/TN3270E protocol support via s3270
-- Standard 3270 operations (PF/PA keys, Enter, Tab, Clear)
-- Screen content reading and text search
-- Screenshot capture for debugging
-- Concurrent VU support with per-VU subprocess isolation
+- Native Go TN3270 (RFC 1576) and TN3270E (RFC 2355) protocol support — no external dependencies
+- EBCDIC Code Page 037 encoding
+- Full 3270 data stream processing (Write, Erase/Write, WSF, SBA, SF, SFE, RA, EUA, etc.)
+- Standard 3270 operations (PF/PA keys, Enter, Tab, BackTab, Clear, Home, MoveCursor)
+- Screen content reading, text search, and screenshot capture
+- Concurrent VU support
 
 ## Prerequisites
 
-- [s3270](http://x3270.bgp.nu/) - The 3270 terminal emulator engine
-
-  ```bash
-  # macOS
-  brew install x3270
-
-  # Ubuntu/Debian
-  apt-get install x3270
-
-  # RHEL/CentOS
-  yum install x3270-x11
-  ```
-
-- [xk6](https://github.com/grafana/xk6) - k6 extension builder
+- [xk6](https://github.com/grafana/xk6) — k6 extension builder
 
   ```bash
   go install go.k6.io/xk6/cmd/xk6@latest
@@ -38,13 +24,13 @@ This extension allows you to perform load testing against IBM mainframe applicat
 
 ## Installation
 
-Build k6 with the xk6-tn3270 extension:
+Build k6 with the extension:
 
 ```bash
 xk6 build --with github.com/msradam/xk6-tn3270
 ```
 
-Or build from local source:
+Build from local source:
 
 ```bash
 git clone https://github.com/msradam/xk6-tn3270.git
@@ -52,51 +38,16 @@ cd xk6-tn3270
 make build
 ```
 
-### Building on z/OS
-
-Building k6 with this extension on z/OS USS requires specific environment configuration:
+Build from a specific branch:
 
 ```bash
-# Required environment variables
-export SSL_CERT_FILE=$ZOPEN_CA                    # CA certificates for HTTPS
-export GOCACHE=/tmp/CB8A/go-cache                 # Use /tmp for build cache (more space)
-export GOMODCACHE=/tmp/CB8A/go-mod                # Use /tmp for module cache
-export LIBPATH=/usr/lib:$LIBPATH                  # Include system libraries for linker
-export GOMAXPROCS=2                               # Limit parallelism to avoid OOM
-
-# Build with afero compatibility fix (required for z/OS)
-xk6 build \
-  --with xk6-tn3270=/path/to/xk6-tn3270 \
-  --replace github.com/spf13/afero=github.com/spf13/afero@v1.11.0 \
-  --output ./k6
+xk6 build --with github.com/msradam/xk6-tn3270@branch-name
 ```
 
-**Key z/OS build requirements:**
-
-1. **SSL certificates**: Set `SSL_CERT_FILE` to a valid CA bundle (e.g., `$ZOPEN_CA` from z/Open)
-2. **Disk space**: Use `/tmp` for Go caches - home directories often have limited space
-3. **Linker libraries**: Add `/usr/lib` to `LIBPATH` for `iewbndd6.so`
-4. **afero replace**: The default afero v1.1.2 is incompatible with z/OS - use v1.11.0+
-5. **Memory**: Limit `GOMAXPROCS` if builds get killed (OOM)
-
-**Full build script example:**
+Or point to a local checkout of any branch:
 
 ```bash
-#!/bin/bash
-source ~/.profile
-
-export SSL_CERT_FILE=$ZOPEN_CA
-export GOCACHE=/tmp/$USER/go-cache
-export GOMODCACHE=/tmp/$USER/go-mod
-export LIBPATH=/usr/lib:$LIBPATH
-export GOMAXPROCS=2
-
-mkdir -p $GOCACHE $GOMODCACHE
-
-xk6 build \
-  --with xk6-tn3270=. \
-  --replace github.com/spf13/afero=github.com/spf13/afero@v1.11.0 \
-  --output ./k6
+xk6 build --with github.com/msradam/xk6-tn3270=/path/to/local/xk6-tn3270
 ```
 
 ## Usage
@@ -107,7 +58,6 @@ import { TN3270 } from 'k6/x/tn3270';
 export default function() {
     const tn = TN3270();
 
-    // Connect to mainframe
     tn.connect('mainframe.example.com', 23);
     tn.waitForField();
 
@@ -118,100 +68,97 @@ export default function() {
     tn.enter();
     tn.waitForField();
 
-    // Navigate using PF keys
-    tn.pf(3);  // PF3 to go back
+    // Navigate
+    tn.pf(3);
     tn.waitForField();
 
-    // Get screen content
+    // Read screen
     const screen = tn.getScreenText();
     console.log(screen);
 
-    // Take a screenshot for debugging
-    tn.screenshot('screenshots/login-screen.txt');
-
-    // Disconnect
     tn.disconnect();
 }
 ```
 
 ## API Reference
 
-### Connection Management
+### Connection
 
 | Method | Description |
 |--------|-------------|
-| `connect(host, port, timeout?)` | Establish TN3270 connection. Timeout in seconds (default: 30, max: 300) |
-| `disconnect()` | Clean shutdown of connection |
-| `isConnected()` | Returns true if currently connected |
+| `connect(host, port, timeout?)` | Connect to a TN3270 host. Timeout in seconds (default: 30, max: 300) |
+| `disconnect()` | Close the connection |
+| `isConnected()` | Returns `true` if connected |
 
-### Basic Input
+### Input
 
 | Method | Description |
 |--------|-------------|
-| `type(text)` | Type text at current cursor position (max 1920 chars) |
-| `string(text)` | Alias for type() |
-| `enter()` | Send Enter key |
-| `tab()` | Send Tab key |
-| `clear()` | Send Clear key |
+| `type(text)` | Type text at the cursor position (max 1920 chars) |
+| `string(text)` | Alias for `type()` |
+| `enter()` | Send Enter |
+| `tab()` | Move to next unprotected field |
+| `backTab()` | Move to previous unprotected field |
+| `clear()` | Send Clear |
+| `home()` | Move cursor to first unprotected field |
+| `moveTo(row, col)` | Move cursor to position (1-based) |
 
 ### Function Keys
 
 | Method | Description |
 |--------|-------------|
-| `pf(key)` | Send PF key (1-24) |
-| `pa(key)` | Send PA key (1-3) |
+| `pf(key)` | Send PF key (1–24) |
+| `pa(key)` | Send PA key (1–3) |
 
-### Screen Operations
+### Screen
 
 | Method | Description |
 |--------|-------------|
-| `waitForField(timeout?)` | Wait for screen to be ready for input. Timeout in seconds (default: 30) |
+| `waitForField(timeout?)` | Wait for an input field to be available. Timeout in seconds (default: 30) |
 | `waitForText(text, timeout?)` | Wait until text appears on screen |
-| `getScreenText()` | Return current screen contents as text |
-| `ascii()` | Alias for getScreenText() |
+| `getScreenText()` | Return screen contents as text (24×80) |
+| `ascii()` | Alias for `getScreenText()` |
 
-### Composite Operations
+### Composite
 
 | Method | Description |
 |--------|-------------|
-| `sendCommand(command, wait?)` | Type text + Enter + optional wait for field (default: true) |
-| `sendPF(key, wait?)` | Send PF key + optional wait for field (default: true) |
+| `sendCommand(command, wait?)` | Type text + Enter + optional wait (default: true) |
+| `sendPF(key, wait?)` | Send PF key + optional wait (default: true) |
 
 ### Debugging
 
 | Method | Description |
 |--------|-------------|
-| `screenshot(path)` | Save current screen to a text file (similar to k6 browser's screenshot) |
-| `printScreen()` | Return formatted screen with line numbers and border for console output |
+| `screenshot(path)` | Save screen to a text file |
+| `printScreen()` | Return formatted screen with line numbers and border |
 
 ## Examples
 
-See [examples/simbank-test.js](examples/simbank-test.js) for a smoke test against [Galasa SimBank](https://galasa.dev/docs/running-simbank-tests/).
+See [examples/simbank-test.js](examples/simbank-test.js) for a complete test against [Galasa SimBank](https://galasa.dev/docs/running-simbank-tests/).
 
 ## Running Tests
 
 ```bash
-# Run unit tests
+# Unit tests
 go test -v ./...
 
-# Start Galasa SimBank for E2E testing
-git clone https://github.com/galasa-dev/simplatform.git
-cd simplatform && ./build-locally.sh && ./run-locally.sh --server
-
-# Run smoke test against SimBank (port 2023)
-make test-simbank
+# Unit tests with race detection
+go test -race ./...
 ```
 
-## How It Works
+## Architecture
 
-This extension uses [s3270](http://x3270.bgp.nu/), the scripting version of the x3270 terminal emulator, as the underlying TN3270 engine. Each k6 VU (Virtual User) spawns its own s3270 subprocess, allowing for concurrent connections to mainframe systems.
-
-The architecture follows the pattern used by other k6 extensions like xk6-browser:
+Each k6 VU gets its own native Go TN3270 emulator instance with a direct TCP connection to the mainframe:
 
 ```
-k6 VU → xk6-tn3270 (Go) → s3270 subprocess → Mainframe
+k6 VU → xk6-tn3270 (Go, native TN3270/TN3270E) → Mainframe
 ```
+
+## Building on z/OS
+
+See [docs/zos-build.md](docs/zos-build.md) for z/OS USS build instructions.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file.
+MIT — see [LICENSE](LICENSE).

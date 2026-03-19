@@ -40,9 +40,15 @@ const (
 	cmdReadModAll    byte = 0x6E
 	cmdEraseAllUnp   byte = 0x6F
 
-	// SNA variants
-	cmdWriteSNA      byte = 0x01
-	cmdEraseWriteSNA byte = 0x05
+	// SNA variants (used in TN3270E and Outbound 3270DS).
+	cmdWriteSNA         byte = 0x01
+	cmdReadBufferSNA    byte = 0x02
+	cmdEraseWriteSNA    byte = 0x05
+	cmdReadModSNA       byte = 0x06
+	cmdEraseWriteAltSNA byte = 0x0D
+	cmdReadModAllSNA    byte = 0x0E
+	cmdEraseAllUnpSNA   byte = 0x0F
+	cmdWSFSNA           byte = 0x11
 )
 
 // 3270 orders.
@@ -74,9 +80,36 @@ const (
 
 // AID (Attention Identifier) bytes.
 const (
+	aidNone  byte = 0x60
 	aidEnter byte = 0x7D
 	aidClear byte = 0x6D
+	aidSF    byte = 0x88 // Structured Field AID for query replies
 )
+
+// WSF structured field types.
+const (
+	sfReadPartition  byte = 0x01
+	sfEraseReset     byte = 0x03
+	sfSetReplyMode   byte = 0x09
+	sfOutbound3270DS byte = 0x40
+)
+
+// Query Reply codes.
+const (
+	qrSummary      byte = 0x80
+	qrUsableArea   byte = 0x81
+	qrCharSets     byte = 0x85
+	qrColor        byte = 0x86
+	qrHighlighting byte = 0x87
+	qrReplyModes   byte = 0x88
+	qrImplicitPart byte = 0xA6
+)
+
+// Supported query reply codes, used in the Summary reply.
+var supportedQRCodes = []byte{
+	qrSummary, qrUsableArea, qrCharSets, qrColor,
+	qrHighlighting, qrReplyModes, qrImplicitPart,
+}
 
 var pfAIDs = [24]byte{
 	0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, // PF1-9
@@ -134,6 +167,7 @@ const (
 
 	// TN3270E data types in the 5-byte header.
 	tn3270eData3270 byte = 0x00
+	tn3270eResponse byte = 0x02
 )
 
 // Emulator implements a native TN3270 terminal emulator.
@@ -149,14 +183,16 @@ type Emulator struct {
 	cursorAddr   int  // Current cursor position
 	bufAddr      int  // Current buffer address during data stream processing
 	keyboardLock bool // Keyboard locked by host
+	lastAID      byte // Last AID sent to the host
 
 	rows int
 	cols int
 	size int
 
 	// TN3270E state
-	tn3270e bool   // True when TN3270E mode is active
-	seqNum  uint16 // Outgoing sequence number for TN3270E headers
+	tn3270e        bool    // True when TN3270E mode is active
+	seqNum         uint16  // Outgoing sequence number for TN3270E headers
+	tn3270eRespHdr [5]byte // Last received TN3270E header
 }
 
 func NewEmulator() *Emulator {
@@ -165,6 +201,7 @@ func NewEmulator() *Emulator {
 		cols:         80,
 		size:         1920,
 		keyboardLock: true,
+		lastAID:      aidNone,
 	}
 }
 
@@ -199,10 +236,8 @@ func (e *Emulator) handshake(timeout time.Duration) error {
 		if err != nil {
 			return fmt.Errorf("failed during initial handshake: %w", err)
 		}
-		if len(msg) > 0 {
-			if err := e.processMessage(msg); err != nil {
-				return fmt.Errorf("failed to process initial screen: %w", err)
-			}
+		if err := e.processAndRespond(msg); err != nil {
+			return fmt.Errorf("failed to process initial screen: %w", err)
 		}
 	}
 
@@ -232,6 +267,8 @@ func (e *Emulator) IsConnected() bool {
 
 // readMessage reads a complete 3270 data stream message, processing
 // telnet commands inline. Returns the raw 3270 data (without telnet framing).
+// In TN3270E mode, the 5-byte header is stored in tn3270eRespHdr and stripped.
+// Returns nil data for non-3270 TN3270E data types.
 func (e *Emulator) readMessage() ([]byte, error) {
 	var data []byte
 	for {
@@ -251,7 +288,11 @@ func (e *Emulator) readMessage() ([]byte, error) {
 				data = append(data, telnetIAC) // Escaped 0xFF
 			case telnetEOR:
 				if e.tn3270e && len(data) >= 5 {
-					data = data[5:] // Strip TN3270E 5-byte header
+					copy(e.tn3270eRespHdr[:], data[:5])
+					data = data[5:]
+					if e.tn3270eRespHdr[0] != tn3270eData3270 {
+						return nil, nil // Non-3270 data type
+					}
 				}
 				return data, nil // End of record
 			case telnetDO:
@@ -297,6 +338,20 @@ func (e *Emulator) readMessage() ([]byte, error) {
 			data = append(data, b)
 		}
 	}
+}
+
+// processAndRespond processes a 3270 message and handles TN3270E
+// positive response acknowledgement if the host requested one.
+func (e *Emulator) processAndRespond(msg []byte) error {
+	if len(msg) > 0 {
+		if err := e.processMessage(msg); err != nil {
+			return err
+		}
+	}
+	if e.tn3270e && e.tn3270eRespHdr[2] == 0x02 {
+		return e.sendTN3270EPositiveResponse()
+	}
+	return nil
 }
 
 func (e *Emulator) handleTelnetDo(opt byte) error {
@@ -397,18 +452,9 @@ func (e *Emulator) sendTelnet(data ...byte) error {
 	return err
 }
 
-// sendData sends 3270 data framed with IAC EOR, escaping any 0xFF bytes.
-// In TN3270E mode, a 5-byte header is prepended.
-func (e *Emulator) sendData(data []byte) error {
+// sendRecord writes a telnet record: escapes 0xFF bytes and appends IAC EOR.
+func (e *Emulator) sendRecord(data []byte) error {
 	var buf bytes.Buffer
-
-	if e.tn3270e {
-		// TN3270E header: data-type, request-flag, response-flag, seq-hi, seq-lo
-		header := [5]byte{tn3270eData3270, 0x00, 0x00, byte((e.seqNum >> 8) & 0xFF), byte(e.seqNum & 0xFF)}
-		buf.Write(header[:])
-		e.seqNum++
-	}
-
 	for _, b := range data {
 		buf.WriteByte(b)
 		if b == telnetIAC {
@@ -421,7 +467,33 @@ func (e *Emulator) sendData(data []byte) error {
 	return err
 }
 
+// sendData sends 3270 data framed with IAC EOR, escaping any 0xFF bytes.
+// In TN3270E mode, a 5-byte header is prepended.
+func (e *Emulator) sendData(data []byte) error {
+	if e.tn3270e {
+		header := [5]byte{tn3270eData3270, 0x00, 0x00, byte((e.seqNum >> 8) & 0xFF), byte(e.seqNum & 0xFF)}
+		e.seqNum++
+		record := make([]byte, 5+len(data))
+		copy(record, header[:])
+		copy(record[5:], data)
+		return e.sendRecord(record)
+	}
+	return e.sendRecord(data)
+}
+
+// sendTN3270EPositiveResponse sends a TN3270E positive response for the
+// last received message, using its sequence number.
+func (e *Emulator) sendTN3270EPositiveResponse() error {
+	seqHi := e.tn3270eRespHdr[3]
+	seqLo := e.tn3270eRespHdr[4]
+	// Header: data_type=RESPONSE, request=0, response=0, seq from received message.
+	// Body: 0x00 0x00 = positive device-end.
+	return e.sendRecord([]byte{tn3270eResponse, 0x00, 0x00, seqHi, seqLo, 0x00, 0x00})
+}
+
 // processMessage handles a complete 3270 data stream message.
+// WCC processing uses two phases per the 3270 Data Stream spec:
+// Reset MDT happens before orders, keyboard restore happens after.
 func (e *Emulator) processMessage(data []byte) error {
 	if len(data) < 1 {
 		return nil
@@ -435,63 +507,87 @@ func (e *Emulator) processMessage(data []byte) error {
 			return fmt.Errorf("eraseWrite: missing WCC byte")
 		}
 		e.eraseScreen()
-		e.processWCC(data[1])
+		wcc := data[1]
+		e.resetMDT(wcc)
 		e.bufAddr = 0
 		if len(data) > 2 {
-			return e.processOrders(data[2:])
+			if err := e.processOrders(data[2:]); err != nil {
+				return err
+			}
 		}
+		e.restoreKeyboard(wcc)
 		return nil
 
 	case cmdWrite, cmdWriteSNA:
 		if len(data) < 2 {
 			return fmt.Errorf("write: missing WCC byte")
 		}
-		e.processWCC(data[1])
+		wcc := data[1]
+		e.resetMDT(wcc)
 		e.bufAddr = 0
 		if len(data) > 2 {
-			return e.processOrders(data[2:])
+			if err := e.processOrders(data[2:]); err != nil {
+				return err
+			}
 		}
+		e.restoreKeyboard(wcc)
 		return nil
 
-	case cmdEraseWriteAlt:
+	case cmdEraseWriteAlt, cmdEraseWriteAltSNA:
 		if len(data) < 2 {
 			return fmt.Errorf("eraseWriteAlt: missing WCC byte")
 		}
 		e.eraseScreen()
-		e.processWCC(data[1])
+		wcc := data[1]
+		e.resetMDT(wcc)
 		e.bufAddr = 0
 		if len(data) > 2 {
-			return e.processOrders(data[2:])
+			if err := e.processOrders(data[2:]); err != nil {
+				return err
+			}
 		}
+		e.restoreKeyboard(wcc)
 		return nil
 
-	case cmdEraseAllUnp:
+	case cmdEraseAllUnp, cmdEraseAllUnpSNA:
 		e.eraseUnprotected()
 		return nil
 
-	case cmdWSF:
-		// Write Structured Field: skip (not needed for basic operation)
-		return nil
+	case cmdWSF, cmdWSFSNA:
+		return e.processWSF(data[1:])
 
-	case cmdReadBuffer, cmdReadMod, cmdReadModAll:
-		// Host is requesting data; handle if needed in future
-		return nil
+	case cmdReadBuffer, cmdReadBufferSNA:
+		return e.sendReadBuffer()
+
+	case cmdReadMod, cmdReadModSNA:
+		return e.sendReadModified(false)
+
+	case cmdReadModAll, cmdReadModAllSNA:
+		return e.sendReadModified(true)
 
 	default:
 		return fmt.Errorf("unknown 3270 command: 0x%02X", cmd)
 	}
 }
 
-func (e *Emulator) processWCC(wcc byte) {
-	if wcc&wccUnlock != 0 {
-		e.keyboardLock = false
-	}
+// resetMDT clears the MDT bit on all fields if the WCC requests it.
+// This runs BEFORE orders/data are processed.
+func (e *Emulator) resetMDT(wcc byte) {
 	if wcc&wccResetMDT != 0 {
 		for i := 0; i < e.size; i++ {
 			if e.isAttr[i] {
 				e.fieldAttrs[i] &^= attrMDT
 			}
 		}
+	}
+}
+
+// restoreKeyboard unlocks the keyboard if the WCC requests it.
+// This runs AFTER orders/data are processed so the screen is complete
+// before user input is allowed.
+func (e *Emulator) restoreKeyboard(wcc byte) {
+	if wcc&wccUnlock != 0 {
+		e.keyboardLock = false
 	}
 }
 
@@ -620,6 +716,257 @@ func (e *Emulator) processOrders(data []byte) error {
 	}
 
 	return nil
+}
+
+// processWSF handles Write Structured Field commands.
+func (e *Emulator) processWSF(data []byte) error {
+	i := 0
+	for i < len(data) {
+		if i+2 > len(data) {
+			break
+		}
+		sfLen := int(data[i])<<8 | int(data[i+1])
+		if sfLen == 0 {
+			sfLen = len(data) - i // Extends to end of record
+		}
+		if sfLen < 3 || i+sfLen > len(data) {
+			break
+		}
+		sfID := data[i+2]
+		sfData := data[i+3 : i+sfLen]
+
+		switch sfID {
+		case sfReadPartition:
+			if err := e.handleReadPartition(sfData); err != nil {
+				return err
+			}
+		case sfEraseReset:
+			e.eraseScreen()
+			e.keyboardLock = false
+		case sfSetReplyMode:
+			// We only support field mode; acknowledge but no state change needed
+		case sfOutbound3270DS:
+			if len(sfData) >= 2 {
+				// sfData[0] is partition ID; sfData[1:] is 3270 command stream
+				if err := e.processMessage(sfData[1:]); err != nil {
+					return err
+				}
+			}
+		}
+
+		i += sfLen
+	}
+	return nil
+}
+
+// handleReadPartition dispatches Read Partition operations.
+func (e *Emulator) handleReadPartition(data []byte) error {
+	if len(data) < 2 {
+		return nil
+	}
+	// data[0] = partition ID (0xFF = default)
+	op := data[1]
+
+	switch op {
+	case 0x02: // Query
+		return e.sendQueryReply()
+	case 0x03: // QueryList
+		return e.sendQueryReply() // Respond with all supported replies
+	case cmdReadBuffer: // Read Buffer (0xF2) within partition
+		return e.sendReadBuffer()
+	case cmdReadMod: // Read Modified (0xF6) within partition
+		return e.sendReadModified(false)
+	case cmdReadModAll: // Read Modified All (0x6E) within partition
+		return e.sendReadModified(true)
+	}
+	return nil
+}
+
+// sendQueryReply sends a structured field query reply with all supported
+// terminal capabilities. This is the response to WSF Read Partition Query.
+func (e *Emulator) sendQueryReply() error {
+	var buf bytes.Buffer
+	buf.WriteByte(aidSF) // Structured Field AID
+
+	// Summary: list of all supported QCODEs
+	e.appendQR(&buf, qrSummary, supportedQRCodes)
+
+	// Usable Area: screen dimensions and addressing mode
+	e.appendQR(&buf, qrUsableArea, []byte{
+		0x01,                                            // 12/14-bit addressing
+		0x00,                                            // no variable cells
+		byte((e.cols >> 8) & 0xFF), byte(e.cols & 0xFF), // usable width
+		byte((e.rows >> 8) & 0xFF), byte(e.rows & 0xFF), // usable height
+		0x01,                                            // units: characters
+		byte((e.cols >> 8) & 0xFF), byte(e.cols & 0xFF), // Xr
+		byte((e.rows >> 8) & 0xFF), byte(e.rows & 0xFF), // Yr
+		0x07,                                            // AW: default cell width
+		0x0C,                                            // AH: default cell height
+		byte((e.size >> 8) & 0xFF), byte(e.size & 0xFF), // buffer size
+	})
+
+	// Character Sets: CP037, GE-capable
+	e.appendQR(&buf, qrCharSets, []byte{
+		0x82,                   // flags: GE + CGCSGID present
+		0x00,                   // more flags
+		0x00,                   // SDW (use default)
+		0x00,                   // SDH (use default)
+		0x00, 0x00, 0x00, 0x00, // Load PS format types
+		0x07, // descriptor length = 7
+		// Character set descriptor: base (CP037)
+		0x00,       // SET: 0
+		0x10,       // FLAGS: non-loadable
+		0x00,       // LCID: 0
+		0x02, 0xB9, // CGCSGID char set: 697
+		0x00, 0x25, // CGCSGID code page: 037
+	})
+
+	// Color: 8 color pairs (neutral)
+	e.appendQR(&buf, qrColor, []byte{
+		0x00,       // flags
+		0x08,       // number of color pairs
+		0x00, 0xF4, // default -> green
+		0xF1, 0xF1, // blue
+		0xF2, 0xF2, // red
+		0xF3, 0xF3, // pink
+		0xF4, 0xF4, // green
+		0xF5, 0xF5, // turquoise
+		0xF6, 0xF6, // yellow
+		0xF7, 0xF7, // neutral white
+	})
+
+	// Highlighting: 5 modes
+	e.appendQR(&buf, qrHighlighting, []byte{
+		0x05,       // number of pairs
+		0x00, 0xF0, // default -> normal
+		0xF1, 0xF1, // blink
+		0xF2, 0xF2, // reverse video
+		0xF4, 0xF4, // underscore
+		0xF8, 0xF8, // intensify
+	})
+
+	// Reply Modes: field, extended field, character
+	e.appendQR(&buf, qrReplyModes, []byte{
+		0x00, // field mode
+		0x01, // extended field mode
+		0x02, // character mode
+	})
+
+	// Implicit Partition: default and alternate screen sizes
+	e.appendQR(&buf, qrImplicitPart, []byte{
+		0x00, 0x00, // reserved
+		0x0B,                                            // length of implicit partition entry
+		0x01,                                            // implicit partition
+		0x00,                                            // reserved
+		byte((e.cols >> 8) & 0xFF), byte(e.cols & 0xFF), // default width
+		byte((e.rows >> 8) & 0xFF), byte(e.rows & 0xFF), // default height
+		byte((e.cols >> 8) & 0xFF), byte(e.cols & 0xFF), // alternate width
+		byte((e.rows >> 8) & 0xFF), byte(e.rows & 0xFF), // alternate height
+	})
+
+	return e.sendData(buf.Bytes())
+}
+
+// appendQR appends a single query reply structured field to buf.
+// Length includes the 2-byte length field itself.
+func (e *Emulator) appendQR(buf *bytes.Buffer, qcode byte, data []byte) {
+	length := 4 + len(data) // 2(length) + 1(SF-ID 0x81) + 1(QCODE) + data
+	buf.WriteByte(byte((length >> 8) & 0xFF))
+	buf.WriteByte(byte(length & 0xFF))
+	buf.WriteByte(0x81) // Query Reply SF ID
+	buf.WriteByte(qcode)
+	buf.Write(data)
+}
+
+// sendReadBuffer sends a Read Buffer response containing the entire screen.
+func (e *Emulator) sendReadBuffer() error {
+	var buf bytes.Buffer
+	buf.WriteByte(e.lastAID)
+	addr := encodeAddr(e.cursorAddr)
+	buf.Write(addr[:])
+
+	for i := 0; i < e.size; i++ {
+		if e.isAttr[i] {
+			buf.WriteByte(orderSF)
+			buf.WriteByte(e.fieldAttrs[i])
+		} else {
+			buf.WriteByte(e.buffer[i])
+		}
+	}
+
+	return e.sendData(buf.Bytes())
+}
+
+// sendReadModified sends a Read Modified response. If all is true,
+// all fields are included regardless of MDT (Read Modified All).
+func (e *Emulator) sendReadModified(all bool) error {
+	var buf bytes.Buffer
+	buf.WriteByte(e.lastAID)
+	addr := encodeAddr(e.cursorAddr)
+	buf.Write(addr[:])
+
+	if all {
+		e.writeAllFields(&buf)
+	} else {
+		e.writeModifiedFields(&buf)
+	}
+
+	return e.sendData(buf.Bytes())
+}
+
+// writeAllFields appends SBA + field data for every field, regardless of MDT.
+func (e *Emulator) writeAllFields(buf *bytes.Buffer) {
+	if !e.isFormatted() {
+		// Unformatted screen: send all non-null data
+		lastNonNull := -1
+		for i := e.size - 1; i >= 0; i-- {
+			if e.buffer[i] != 0x00 {
+				lastNonNull = i
+				break
+			}
+		}
+		if lastNonNull >= 0 {
+			addr := encodeAddr(0)
+			buf.WriteByte(orderSBA)
+			buf.Write(addr[:])
+			for i := 0; i <= lastNonNull; i++ {
+				buf.WriteByte(e.buffer[i])
+			}
+		}
+		return
+	}
+
+	for i := 0; i < e.size; i++ {
+		if !e.isAttr[i] {
+			continue
+		}
+
+		dataStart := (i + 1) % e.size
+		var fieldData []byte
+		cur := dataStart
+		for {
+			if e.isAttr[cur] {
+				break
+			}
+			fieldData = append(fieldData, e.buffer[cur])
+			cur = (cur + 1) % e.size
+			if cur == dataStart {
+				break
+			}
+		}
+
+		// Strip trailing nulls
+		for len(fieldData) > 0 && fieldData[len(fieldData)-1] == 0x00 {
+			fieldData = fieldData[:len(fieldData)-1]
+		}
+
+		if len(fieldData) > 0 {
+			addr := encodeAddr(dataStart)
+			buf.WriteByte(orderSBA)
+			buf.Write(addr[:])
+			buf.Write(fieldData)
+		}
+	}
 }
 
 func (e *Emulator) eraseScreen() {
@@ -805,6 +1152,8 @@ func (e *Emulator) TypeString(text string) error {
 
 // sendAID sends an AID response (Enter, PF, PA, Clear) and reads the host reply.
 func (e *Emulator) sendAID(aid byte, timeout time.Duration) error {
+	e.lastAID = aid
+
 	var buf bytes.Buffer
 	buf.WriteByte(aid)
 
@@ -896,10 +1245,8 @@ func (e *Emulator) readUntilUnlocked(timeout time.Duration) error {
 		if err != nil {
 			return fmt.Errorf("failed to read host response: %w", err)
 		}
-		if len(msg) > 0 {
-			if err := e.processMessage(msg); err != nil {
-				return fmt.Errorf("failed to process host response: %w", err)
-			}
+		if err := e.processAndRespond(msg); err != nil {
+			return fmt.Errorf("failed to process host response: %w", err)
 		}
 	}
 	return nil
@@ -928,10 +1275,8 @@ func (e *Emulator) WaitForField(timeout time.Duration) error {
 			}
 			return err
 		}
-		if len(msg) > 0 {
-			if err := e.processMessage(msg); err != nil {
-				return err
-			}
+		if err := e.processAndRespond(msg); err != nil {
+			return err
 		}
 		if e.HasUnlockedField() {
 			return nil
