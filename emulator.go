@@ -3,6 +3,8 @@ package tn3270
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -21,6 +23,7 @@ const (
 	telnetEOR  byte = 0xEF
 
 	telnetOptBinary   byte = 0x00
+	telnetOptSGA      byte = 0x03 // Suppress Go-Ahead
 	telnetOptTermType byte = 0x18
 	telnetOptEOR      byte = 0x19
 	telnetOptTN3270E  byte = 0x28
@@ -105,6 +108,40 @@ const (
 	qrImplicitPart byte = 0xA6
 )
 
+// Extended attribute type identifiers (as used in SFE/SA/MF type-value pairs).
+const (
+	extAttrBasic     byte = 0xC0 // 3270 field attribute
+	extAttrHighlight byte = 0x41 // Extended highlighting
+	extAttrColor     byte = 0x42 // Foreground color
+	extAttrBgColor   byte = 0x45 // Background color
+	extAttrCharSet   byte = 0x43 // Character set
+	extAttrTransp    byte = 0x46 // Transparency
+)
+
+// Reply mode values for WSF Set Reply Mode.
+const (
+	replyModeField    byte = 0x00
+	replyModeExtField byte = 0x01
+	replyModeChar     byte = 0x02
+)
+
+// Connection states.
+const (
+	connNotConnected = iota
+	connPending      // TCP connected, telnet negotiation in progress
+	connTN3270       // Plain TN3270 mode
+	connTN3270E      // TN3270E mode
+)
+
+// TN3270E function codes (RFC 2355 section 7).
+const (
+	tn3270eFuncBindImage     byte = 0x00
+	tn3270eFuncDataStreamCtl byte = 0x01
+	tn3270eFuncResponses     byte = 0x02
+	tn3270eFuncSCSCtlCodes   byte = 0x03
+	tn3270eFuncSysReq        byte = 0x04
+)
+
 // Supported query reply codes, used in the Summary reply.
 var supportedQRCodes = []byte{
 	qrSummary, qrUsableArea, qrCharSets, qrColor,
@@ -157,6 +194,22 @@ func decodeAddr(b1, b2 byte) int {
 	return int(addrReverse[b1])<<6 | int(addrReverse[b2])
 }
 
+// Terminal model definitions.
+type termModel struct {
+	name    string // Terminal type string (e.g., "IBM-3278-2-E")
+	rows    int
+	cols    int
+	altRows int
+	altCols int
+}
+
+var termModels = map[int]termModel{
+	2: {name: "IBM-3278-2-E", rows: 24, cols: 80, altRows: 24, altCols: 80},
+	3: {name: "IBM-3278-3-E", rows: 24, cols: 80, altRows: 32, altCols: 80},
+	4: {name: "IBM-3278-4-E", rows: 24, cols: 80, altRows: 43, altCols: 80},
+	5: {name: "IBM-3278-5-E", rows: 24, cols: 80, altRows: 27, altCols: 132},
+}
+
 // TN3270E subnegotiation constants (RFC 2355).
 const (
 	tn3270eSend       byte = 0x08
@@ -166,50 +219,138 @@ const (
 	tn3270eIs         byte = 0x04
 
 	// TN3270E data types in the 5-byte header.
-	tn3270eData3270 byte = 0x00
-	tn3270eResponse byte = 0x02
+	tn3270eData3270    byte = 0x00
+	tn3270eSCSData     byte = 0x01
+	tn3270eResponse    byte = 0x02
+	tn3270eBindImage   byte = 0x03
+	tn3270eUnbind      byte = 0x04
+	tn3270eNVTData     byte = 0x05
+	tn3270eRequest3270 byte = 0x06
+	tn3270eSSCPLUData  byte = 0x07
 )
+
+// extAttrs holds extended attributes for a single screen position.
+type extAttrs struct {
+	highlight byte // Extended highlighting (blink, reverse, underscore, etc.)
+	color     byte // Foreground color
+	bgColor   byte // Background color
+	charSet   byte // Character set (LCID)
+	ge        bool // True if this position was written via Graphic Escape
+}
 
 // Emulator implements a native TN3270 terminal emulator.
 type Emulator struct {
 	conn   net.Conn
 	reader *bufio.Reader
 
-	// Screen buffer
-	buffer     [1920]byte // EBCDIC character data
-	fieldAttrs [1920]byte // Field attribute at field start positions
-	isAttr     [1920]bool // True if position is a field attribute
+	// Screen buffer — dynamically allocated based on model/alternate size
+	buffer     []byte     // EBCDIC character data
+	fieldAttrs []byte     // Field attribute at field start positions
+	isAttr     []bool     // True if position is a field attribute
+	extFields  []extAttrs // Extended attributes per position
 
 	cursorAddr   int  // Current cursor position
 	bufAddr      int  // Current buffer address during data stream processing
 	keyboardLock bool // Keyboard locked by host
 	lastAID      byte // Last AID sent to the host
 
-	rows int
-	cols int
-	size int
+	// Screen dimensions
+	rows    int  // Current rows (may be default or alternate)
+	cols    int  // Current cols
+	size    int  // rows * cols
+	model   int  // Terminal model number (2-5)
+	defRows int  // Default screen rows
+	defCols int  // Default screen cols
+	altRows int  // Alternate screen rows
+	altCols int  // Alternate screen cols
+	useAlt  bool // True if alternate screen size is active
+
+	// Connection state
+	connState int
+
+	// Reply mode: field (0x00), extended field (0x01), character (0x02)
+	replyMode     byte
+	replyModeAttr []byte // Attribute types requested in character mode
+
+	// Character mode SA tracking — current values set by SA orders
+	curHighlight byte
+	curColor     byte
+	curBgColor   byte
+	curCharSet   byte
 
 	// TN3270E state
-	tn3270e        bool    // True when TN3270E mode is active
-	seqNum         uint16  // Outgoing sequence number for TN3270E headers
-	tn3270eRespHdr [5]byte // Last received TN3270E header
+	tn3270e          bool    // True when TN3270E mode is active
+	tn3270eResponses bool    // True if RESPONSES function was negotiated
+	seqNum           uint16  // Outgoing sequence number for TN3270E headers
+	tn3270eRespHdr   [5]byte // Last received TN3270E header
+
+	// TLS
+	useTLS      bool
+	tlsInsecure bool
+
+	// Code page
+	codePage *CodePage
 }
 
 func NewEmulator() *Emulator {
-	return &Emulator{
-		rows:         24,
-		cols:         80,
-		size:         1920,
+	return newEmulatorModel(2)
+}
+
+func NewEmulatorModel(model int) *Emulator {
+	if _, ok := termModels[model]; !ok {
+		model = 2
+	}
+	return newEmulatorModel(model)
+}
+
+func newEmulatorModel(model int) *Emulator {
+	tm := termModels[model]
+	defSize := tm.rows * tm.cols
+	e := &Emulator{
+		model:        model,
+		defRows:      tm.rows,
+		defCols:      tm.cols,
+		altRows:      tm.altRows,
+		altCols:      tm.altCols,
+		rows:         tm.rows,
+		cols:         tm.cols,
+		size:         defSize,
 		keyboardLock: true,
 		lastAID:      aidNone,
+		connState:    connNotConnected,
+		replyMode:    replyModeField,
 	}
+	maxSize := tm.altRows * tm.altCols
+	if defSize > maxSize {
+		maxSize = defSize
+	}
+	e.buffer = make([]byte, maxSize)
+	e.fieldAttrs = make([]byte, maxSize)
+	e.isAttr = make([]bool, maxSize)
+	e.extFields = make([]extAttrs, maxSize)
+	return e
 }
 
 // Connect establishes a TN3270 connection to the given host and port.
 // Telnet negotiation and initial screen reading happen synchronously.
 func (e *Emulator) Connect(host string, port int, timeout time.Duration) error {
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	var conn net.Conn
+	var err error
+
+	if e.useTLS {
+		tlsConf := &tls.Config{
+			InsecureSkipVerify: e.tlsInsecure, //#nosec G402 -- user-controlled option for self-signed certs
+			ServerName:         host,
+		}
+		dialer := &tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: timeout},
+			Config:    tlsConf,
+		}
+		conn, err = dialer.DialContext(context.Background(), "tcp", addr)
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, timeout)
+	}
 	if err != nil {
 		return fmt.Errorf("tcp connection failed: %w", err)
 	}
@@ -217,6 +358,7 @@ func (e *Emulator) Connect(host string, port int, timeout time.Duration) error {
 	e.conn = conn
 	e.reader = bufio.NewReader(conn)
 	e.keyboardLock = true
+	e.connState = connPending
 	e.eraseScreen()
 
 	if err := e.handshake(timeout); err != nil {
@@ -253,6 +395,7 @@ func (e *Emulator) closeConn() {
 		_ = e.conn.Close()
 		e.conn = nil
 	}
+	e.connState = connNotConnected
 }
 
 // Disconnect closes the TN3270 connection.
@@ -262,7 +405,7 @@ func (e *Emulator) Disconnect() {
 
 // IsConnected returns true if the emulator has an active connection.
 func (e *Emulator) IsConnected() bool {
-	return e.conn != nil
+	return e.conn != nil && e.connState >= connTN3270
 }
 
 // readMessage reads a complete 3270 data stream message, processing
@@ -287,11 +430,24 @@ func (e *Emulator) readMessage() ([]byte, error) {
 			case telnetIAC:
 				data = append(data, telnetIAC) // Escaped 0xFF
 			case telnetEOR:
-				if e.tn3270e && len(data) >= 5 {
-					copy(e.tn3270eRespHdr[:], data[:5])
-					data = data[5:]
-					if e.tn3270eRespHdr[0] != tn3270eData3270 {
-						return nil, nil // Non-3270 data type
+				if e.tn3270e {
+					if len(data) >= 5 {
+						copy(e.tn3270eRespHdr[:], data[:5])
+						data = data[5:]
+						dataType := e.tn3270eRespHdr[0]
+						switch dataType {
+						case tn3270eData3270:
+							// Fall through to return data
+						case tn3270eSSCPLUData:
+							// SSCP-LU data: treat as displayable text
+							return data, nil
+						default:
+							// Non-3270 data type (SCS, BIND, UNBIND, NVT, etc.)
+							return nil, nil
+						}
+					} else {
+						// Short TN3270E record (< 5 bytes); skip
+						return nil, nil
 					}
 				}
 				return data, nil // End of record
@@ -348,7 +504,7 @@ func (e *Emulator) processAndRespond(msg []byte) error {
 			return err
 		}
 	}
-	if e.tn3270e && e.tn3270eRespHdr[2] == 0x02 {
+	if e.tn3270e && e.tn3270eResponses && e.tn3270eRespHdr[2] == 0x02 {
 		return e.sendTN3270EPositiveResponse()
 	}
 	return nil
@@ -356,7 +512,7 @@ func (e *Emulator) processAndRespond(msg []byte) error {
 
 func (e *Emulator) handleTelnetDo(opt byte) error {
 	switch opt {
-	case telnetOptTermType, telnetOptEOR, telnetOptBinary, telnetOptTN3270E:
+	case telnetOptTermType, telnetOptEOR, telnetOptBinary, telnetOptTN3270E, telnetOptSGA:
 		return e.sendTelnet(telnetIAC, telnetWILL, opt)
 	default:
 		return e.sendTelnet(telnetIAC, telnetWONT, opt)
@@ -365,7 +521,7 @@ func (e *Emulator) handleTelnetDo(opt byte) error {
 
 func (e *Emulator) handleTelnetWill(opt byte) error {
 	switch opt {
-	case telnetOptEOR, telnetOptBinary, telnetOptTN3270E:
+	case telnetOptEOR, telnetOptBinary, telnetOptTN3270E, telnetOptSGA:
 		return e.sendTelnet(telnetIAC, telnetDO, opt)
 	default:
 		return e.sendTelnet(telnetIAC, telnetDONT, opt)
@@ -396,8 +552,9 @@ func (e *Emulator) handleSubnegotiation() error {
 	}
 
 	if len(subData) >= 2 && subData[0] == telnetOptTermType && subData[1] == telnetTermTypeSend {
+		tm := termModels[e.model]
 		resp := []byte{telnetIAC, telnetSB, telnetOptTermType, telnetTermTypeIs}
-		resp = append(resp, []byte("IBM-3278-2")...)
+		resp = append(resp, []byte(tm.name)...)
 		resp = append(resp, telnetIAC, telnetSE)
 		_, err := e.conn.Write(resp)
 		return err
@@ -417,30 +574,75 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 
 	switch data[0] {
 	case tn3270eSend:
-		// SEND DEVICE-TYPE: respond with DEVICE-TYPE REQUEST IBM-3278-2
+		// SEND DEVICE-TYPE: respond with DEVICE-TYPE REQUEST <term-type>
 		if len(data) >= 2 && data[1] == tn3270eDeviceType {
+			tm := termModels[e.model]
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eDeviceType, tn3270eRequest}
-			resp = append(resp, []byte("IBM-3278-2")...)
+			resp = append(resp, []byte(tm.name)...)
 			resp = append(resp, telnetIAC, telnetSE)
 			_, err := e.conn.Write(resp)
 			return err
 		}
 
 	case tn3270eDeviceType:
-		// DEVICE-TYPE IS: server acknowledged device type.
-		// Client must now send FUNCTIONS REQUEST to complete TN3270E negotiation.
-		if len(data) >= 2 && data[1] == tn3270eIs {
-			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eRequest, telnetIAC, telnetSE}
+		if len(data) < 2 {
+			return nil
+		}
+		switch data[1] {
+		case tn3270eIs:
+			// DEVICE-TYPE IS: server acknowledged device type.
+			// Client must now send FUNCTIONS REQUEST to complete TN3270E negotiation.
+			// Request RESPONSES function for proper acknowledgement support.
+			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eRequest,
+				tn3270eFuncResponses,
+				telnetIAC, telnetSE}
 			_, err := e.conn.Write(resp)
 			return err
+		case 0x06: // REJECT
+			// Server rejected our device type or TN3270E entirely.
+			// Fall back to plain TN3270 by sending WONT TN3270E.
+			e.connState = connTN3270
+			return e.sendTelnet(telnetIAC, telnetWONT, telnetOptTN3270E)
 		}
 		return nil
 
 	case tn3270eFunctions:
-		// FUNCTIONS IS: server accepted our functions request. TN3270E is now active.
-		if len(data) >= 2 && data[1] == tn3270eIs {
-			e.tn3270e = true
+		if len(data) < 2 {
 			return nil
+		}
+		switch data[1] {
+		case tn3270eIs:
+			// FUNCTIONS IS: server accepted. Parse which functions are active.
+			e.tn3270e = true
+			e.connState = connTN3270E
+			e.tn3270eResponses = false
+			for _, f := range data[2:] {
+				if f == tn3270eFuncResponses {
+					e.tn3270eResponses = true
+				}
+			}
+		case tn3270eRequest:
+			// Server sent FUNCTIONS REQUEST with its preferred list.
+			// Intersect with what we support (only RESPONSES).
+			var accepted []byte
+			for _, f := range data[2:] {
+				if f == tn3270eFuncResponses {
+					accepted = append(accepted, f)
+					e.tn3270eResponses = true
+				}
+			}
+			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eIs}
+			resp = append(resp, accepted...)
+			resp = append(resp, telnetIAC, telnetSE)
+			if _, err := e.conn.Write(resp); err != nil {
+				return err
+			}
+			e.tn3270e = true
+			e.connState = connTN3270E
+		case 0x06: // REJECT
+			// Fall back to plain TN3270.
+			e.connState = connTN3270
+			return e.sendTelnet(telnetIAC, telnetWONT, telnetOptTN3270E)
 		}
 	}
 
@@ -506,6 +708,7 @@ func (e *Emulator) processMessage(data []byte) error {
 		if len(data) < 2 {
 			return fmt.Errorf("eraseWrite: missing WCC byte")
 		}
+		e.switchScreenSize(false)
 		e.eraseScreen()
 		wcc := data[1]
 		e.resetMDT(wcc)
@@ -537,6 +740,7 @@ func (e *Emulator) processMessage(data []byte) error {
 		if len(data) < 2 {
 			return fmt.Errorf("eraseWriteAlt: missing WCC byte")
 		}
+		e.switchScreenSize(true)
 		e.eraseScreen()
 		wcc := data[1]
 		e.resetMDT(wcc)
@@ -566,8 +770,25 @@ func (e *Emulator) processMessage(data []byte) error {
 		return e.sendReadModified(true)
 
 	default:
-		return fmt.Errorf("unknown 3270 command: 0x%02X", cmd)
+		// Unknown or unimplemented command (e.g., NOP 0x03).
+		// Ignore gracefully — real z/OS hosts send commands that
+		// a load testing emulator does not need to act on.
+		return nil
 	}
+}
+
+// switchScreenSize switches between default and alternate screen sizes.
+func (e *Emulator) switchScreenSize(alt bool) {
+	if alt && (e.altRows != e.defRows || e.altCols != e.defCols) {
+		e.rows = e.altRows
+		e.cols = e.altCols
+		e.useAlt = true
+	} else {
+		e.rows = e.defRows
+		e.cols = e.defCols
+		e.useAlt = false
+	}
+	e.size = e.rows * e.cols
 }
 
 // resetMDT clears the MDT bit on all fields if the WCC requests it.
@@ -588,6 +809,13 @@ func (e *Emulator) resetMDT(wcc byte) {
 func (e *Emulator) restoreKeyboard(wcc byte) {
 	if wcc&wccUnlock != 0 {
 		e.keyboardLock = false
+		if e.connState == connPending {
+			if e.tn3270e {
+				e.connState = connTN3270E
+			} else {
+				e.connState = connTN3270
+			}
+		}
 	}
 }
 
@@ -613,6 +841,7 @@ func (e *Emulator) processOrders(data []byte) error {
 			e.isAttr[e.bufAddr] = true
 			e.fieldAttrs[e.bufAddr] = data[i+1]
 			e.buffer[e.bufAddr] = 0x00
+			e.extFields[e.bufAddr] = extAttrs{}
 			e.bufAddr = (e.bufAddr + 1) % e.size
 			i += 2
 
@@ -626,14 +855,27 @@ func (e *Emulator) processOrders(data []byte) error {
 				return fmt.Errorf("sfe: insufficient data at offset %d", i)
 			}
 			attr := byte(0)
+			ea := extAttrs{}
 			for j := 0; j < count; j++ {
-				if data[i+2+j*2] == 0xC0 {
-					attr = data[i+2+j*2+1]
+				attrType := data[i+2+j*2]
+				attrVal := data[i+2+j*2+1]
+				switch attrType {
+				case extAttrBasic:
+					attr = attrVal
+				case extAttrHighlight:
+					ea.highlight = attrVal
+				case extAttrColor:
+					ea.color = attrVal
+				case extAttrBgColor:
+					ea.bgColor = attrVal
+				case extAttrCharSet:
+					ea.charSet = attrVal
 				}
 			}
 			e.isAttr[e.bufAddr] = true
 			e.fieldAttrs[e.bufAddr] = attr
 			e.buffer[e.bufAddr] = 0x00
+			e.extFields[e.bufAddr] = ea
 			e.bufAddr = (e.bufAddr + 1) % e.size
 			i += needed
 
@@ -641,7 +883,19 @@ func (e *Emulator) processOrders(data []byte) error {
 			if i+2 >= len(data) {
 				return fmt.Errorf("sa: insufficient data at offset %d", i)
 			}
-			i += 3 // Skip extended attribute (type + value)
+			attrType := data[i+1]
+			attrVal := data[i+2]
+			switch attrType {
+			case extAttrHighlight:
+				e.curHighlight = attrVal
+			case extAttrColor:
+				e.curColor = attrVal
+			case extAttrBgColor:
+				e.curBgColor = attrVal
+			case extAttrCharSet:
+				e.curCharSet = attrVal
+			}
+			i += 3
 
 		case orderMF:
 			if i+1 >= len(data) {
@@ -653,8 +907,21 @@ func (e *Emulator) processOrders(data []byte) error {
 				return fmt.Errorf("mf: insufficient data at offset %d", i)
 			}
 			for j := 0; j < count; j++ {
-				if data[i+2+j*2] == 0xC0 && e.isAttr[e.bufAddr] {
-					e.fieldAttrs[e.bufAddr] = data[i+2+j*2+1]
+				attrType := data[i+2+j*2]
+				attrVal := data[i+2+j*2+1]
+				switch attrType {
+				case extAttrBasic:
+					if e.isAttr[e.bufAddr] {
+						e.fieldAttrs[e.bufAddr] = attrVal
+					}
+				case extAttrHighlight:
+					e.extFields[e.bufAddr].highlight = attrVal
+				case extAttrColor:
+					e.extFields[e.bufAddr].color = attrVal
+				case extAttrBgColor:
+					e.extFields[e.bufAddr].bgColor = attrVal
+				case extAttrCharSet:
+					e.extFields[e.bufAddr].charSet = attrVal
 				}
 			}
 			i += needed
@@ -675,8 +942,20 @@ func (e *Emulator) processOrders(data []byte) error {
 			}
 			endAddr := decodeAddr(data[i+1], data[i+2]) % e.size
 			fillChar := data[i+3]
+			// Check for GE variant: if the byte after RA address is orderGE, the
+			// fill character follows it and should be marked as GE.
+			isGE := false
+			if fillChar == orderGE && i+4 < len(data) {
+				fillChar = data[i+4]
+				isGE = true
+				i++ // consume extra byte
+			}
 			for e.bufAddr != endAddr {
 				e.buffer[e.bufAddr] = fillChar
+				if isGE {
+					e.extFields[e.bufAddr].ge = true
+				}
+				e.applyCurrentSA(e.bufAddr)
 				e.bufAddr = (e.bufAddr + 1) % e.size
 			}
 			i += 4
@@ -689,6 +968,7 @@ func (e *Emulator) processOrders(data []byte) error {
 			for e.bufAddr != endAddr {
 				if !e.isAttr[e.bufAddr] && !e.isFieldProtectedAt(e.bufAddr) {
 					e.buffer[e.bufAddr] = 0x00
+					e.extFields[e.bufAddr] = extAttrs{}
 				}
 				e.bufAddr = (e.bufAddr + 1) % e.size
 			}
@@ -699,12 +979,16 @@ func (e *Emulator) processOrders(data []byte) error {
 				return fmt.Errorf("ge: missing character at offset %d", i)
 			}
 			e.buffer[e.bufAddr] = data[i+1]
+			e.extFields[e.bufAddr].ge = true
+			e.applyCurrentSA(e.bufAddr)
 			e.bufAddr = (e.bufAddr + 1) % e.size
 			i += 2
 
 		default:
 			// Data byte: place in buffer
 			e.buffer[e.bufAddr] = b
+			e.extFields[e.bufAddr].ge = false
+			e.applyCurrentSA(e.bufAddr)
 			e.bufAddr = (e.bufAddr + 1) % e.size
 			i++
 		}
@@ -716,6 +1000,30 @@ func (e *Emulator) processOrders(data []byte) error {
 	}
 
 	return nil
+}
+
+// applyCurrentSA stores the current SA-set attributes to a position.
+func (e *Emulator) applyCurrentSA(pos int) {
+	if e.curHighlight != 0 {
+		e.extFields[pos].highlight = e.curHighlight
+	}
+	if e.curColor != 0 {
+		e.extFields[pos].color = e.curColor
+	}
+	if e.curBgColor != 0 {
+		e.extFields[pos].bgColor = e.curBgColor
+	}
+	if e.curCharSet != 0 {
+		e.extFields[pos].charSet = e.curCharSet
+	}
+}
+
+// resetCurrentSA resets current SA values (called at start of write commands).
+func (e *Emulator) resetCurrentSA() {
+	e.curHighlight = 0
+	e.curColor = 0
+	e.curBgColor = 0
+	e.curCharSet = 0
 }
 
 // processWSF handles Write Structured Field commands.
@@ -744,7 +1052,7 @@ func (e *Emulator) processWSF(data []byte) error {
 			e.eraseScreen()
 			e.keyboardLock = false
 		case sfSetReplyMode:
-			// We only support field mode; acknowledge but no state change needed
+			e.handleSetReplyMode(sfData)
 		case sfOutbound3270DS:
 			if len(sfData) >= 2 {
 				// sfData[0] is partition ID; sfData[1:] is 3270 command stream
@@ -757,6 +1065,25 @@ func (e *Emulator) processWSF(data []byte) error {
 		i += sfLen
 	}
 	return nil
+}
+
+// handleSetReplyMode processes WSF Set Reply Mode.
+func (e *Emulator) handleSetReplyMode(data []byte) {
+	if len(data) < 2 {
+		return
+	}
+	// data[0] = partition ID, data[1] = mode
+	mode := data[1]
+	if mode <= replyModeChar {
+		e.replyMode = mode
+	}
+	// In character mode, remaining bytes are the attribute types to include
+	if mode == replyModeChar && len(data) > 2 {
+		e.replyModeAttr = make([]byte, len(data)-2)
+		copy(e.replyModeAttr, data[2:])
+	} else {
+		e.replyModeAttr = nil
+	}
 }
 
 // handleReadPartition dispatches Read Partition operations.
@@ -792,17 +1119,21 @@ func (e *Emulator) sendQueryReply() error {
 	e.appendQR(&buf, qrSummary, supportedQRCodes)
 
 	// Usable Area: screen dimensions and addressing mode
+	// Report alternate screen size if model supports it, otherwise default
+	usableRows := e.altRows
+	usableCols := e.altCols
+	usableSize := usableRows * usableCols
 	e.appendQR(&buf, qrUsableArea, []byte{
-		0x01,                                            // 12/14-bit addressing
-		0x00,                                            // no variable cells
-		byte((e.cols >> 8) & 0xFF), byte(e.cols & 0xFF), // usable width
-		byte((e.rows >> 8) & 0xFF), byte(e.rows & 0xFF), // usable height
-		0x01,                                            // units: characters
-		byte((e.cols >> 8) & 0xFF), byte(e.cols & 0xFF), // Xr
-		byte((e.rows >> 8) & 0xFF), byte(e.rows & 0xFF), // Yr
-		0x07,                                            // AW: default cell width
-		0x0C,                                            // AH: default cell height
-		byte((e.size >> 8) & 0xFF), byte(e.size & 0xFF), // buffer size
+		0x01,                                                    // 12/14-bit addressing
+		0x00,                                                    // no variable cells
+		byte((usableCols >> 8) & 0xFF), byte(usableCols & 0xFF), // usable width
+		byte((usableRows >> 8) & 0xFF), byte(usableRows & 0xFF), // usable height
+		0x01,                                                    // units: characters
+		byte((usableCols >> 8) & 0xFF), byte(usableCols & 0xFF), // Xr
+		byte((usableRows >> 8) & 0xFF), byte(usableRows & 0xFF), // Yr
+		0x07,                                                    // AW: default cell width
+		0x0C,                                                    // AH: default cell height
+		byte((usableSize >> 8) & 0xFF), byte(usableSize & 0xFF), // buffer size
 	})
 
 	// Character Sets: CP037, GE-capable
@@ -855,13 +1186,13 @@ func (e *Emulator) sendQueryReply() error {
 	// Implicit Partition: default and alternate screen sizes
 	e.appendQR(&buf, qrImplicitPart, []byte{
 		0x00, 0x00, // reserved
-		0x0B,                                            // length of implicit partition entry
-		0x01,                                            // implicit partition
-		0x00,                                            // reserved
-		byte((e.cols >> 8) & 0xFF), byte(e.cols & 0xFF), // default width
-		byte((e.rows >> 8) & 0xFF), byte(e.rows & 0xFF), // default height
-		byte((e.cols >> 8) & 0xFF), byte(e.cols & 0xFF), // alternate width
-		byte((e.rows >> 8) & 0xFF), byte(e.rows & 0xFF), // alternate height
+		0x0B,                                                  // length of implicit partition entry
+		0x01,                                                  // implicit partition
+		0x00,                                                  // reserved
+		byte((e.defCols >> 8) & 0xFF), byte(e.defCols & 0xFF), // default width
+		byte((e.defRows >> 8) & 0xFF), byte(e.defRows & 0xFF), // default height
+		byte((e.altCols >> 8) & 0xFF), byte(e.altCols & 0xFF), // alternate width
+		byte((e.altRows >> 8) & 0xFF), byte(e.altRows & 0xFF), // alternate height
 	})
 
 	return e.sendData(buf.Bytes())
@@ -879,22 +1210,121 @@ func (e *Emulator) appendQR(buf *bytes.Buffer, qcode byte, data []byte) {
 }
 
 // sendReadBuffer sends a Read Buffer response containing the entire screen.
+// Response format depends on the current reply mode.
 func (e *Emulator) sendReadBuffer() error {
 	var buf bytes.Buffer
 	buf.WriteByte(e.lastAID)
 	addr := encodeAddr(e.cursorAddr)
 	buf.Write(addr[:])
 
-	for i := 0; i < e.size; i++ {
-		if e.isAttr[i] {
-			buf.WriteByte(orderSF)
-			buf.WriteByte(e.fieldAttrs[i])
-		} else {
-			buf.WriteByte(e.buffer[i])
+	switch e.replyMode {
+	case replyModeField:
+		for i := 0; i < e.size; i++ {
+			if e.isAttr[i] {
+				buf.WriteByte(orderSF)
+				buf.WriteByte(e.fieldAttrs[i])
+			} else {
+				buf.WriteByte(e.buffer[i])
+			}
 		}
+	case replyModeExtField:
+		for i := 0; i < e.size; i++ {
+			if e.isAttr[i] {
+				e.writeSFE(&buf, i)
+			} else {
+				if e.extFields[i].ge {
+					buf.WriteByte(orderGE)
+				}
+				buf.WriteByte(e.buffer[i])
+			}
+		}
+	case replyModeChar:
+		e.writeCharacterModeBuffer(&buf)
 	}
 
 	return e.sendData(buf.Bytes())
+}
+
+// writeSFE writes an SFE order with field attribute and any extended attributes.
+func (e *Emulator) writeSFE(buf *bytes.Buffer, pos int) {
+	ea := e.extFields[pos]
+	pairs := []struct {
+		typ byte
+		val byte
+	}{
+		{extAttrBasic, e.fieldAttrs[pos]},
+	}
+	if ea.highlight != 0 {
+		pairs = append(pairs, struct{ typ, val byte }{extAttrHighlight, ea.highlight})
+	}
+	if ea.color != 0 {
+		pairs = append(pairs, struct{ typ, val byte }{extAttrColor, ea.color})
+	}
+	if ea.bgColor != 0 {
+		pairs = append(pairs, struct{ typ, val byte }{extAttrBgColor, ea.bgColor})
+	}
+	if ea.charSet != 0 {
+		pairs = append(pairs, struct{ typ, val byte }{extAttrCharSet, ea.charSet})
+	}
+
+	buf.WriteByte(orderSFE)
+	buf.WriteByte(byte(len(pairs) & 0xFF))
+	for _, p := range pairs {
+		buf.WriteByte(p.typ)
+		buf.WriteByte(p.val)
+	}
+}
+
+// writeCharacterModeBuffer writes the buffer in character mode, interleaving
+// SA orders whenever extended attributes change.
+func (e *Emulator) writeCharacterModeBuffer(buf *bytes.Buffer) {
+	var lastHL, lastFG, lastBG, lastCS byte
+
+	for i := 0; i < e.size; i++ {
+		if e.isAttr[i] {
+			e.writeSFE(buf, i)
+			// Reset SA tracking at field boundaries
+			ea := e.extFields[i]
+			lastHL = ea.highlight
+			lastFG = ea.color
+			lastBG = ea.bgColor
+			lastCS = ea.charSet
+			continue
+		}
+
+		ea := e.extFields[i]
+
+		// Emit SA orders for changed attributes
+		if ea.highlight != lastHL {
+			buf.WriteByte(orderSA)
+			buf.WriteByte(extAttrHighlight)
+			buf.WriteByte(ea.highlight)
+			lastHL = ea.highlight
+		}
+		if ea.color != lastFG {
+			buf.WriteByte(orderSA)
+			buf.WriteByte(extAttrColor)
+			buf.WriteByte(ea.color)
+			lastFG = ea.color
+		}
+		if ea.bgColor != lastBG {
+			buf.WriteByte(orderSA)
+			buf.WriteByte(extAttrBgColor)
+			buf.WriteByte(ea.bgColor)
+			lastBG = ea.bgColor
+		}
+		if ea.charSet != lastCS {
+			buf.WriteByte(orderSA)
+			buf.WriteByte(extAttrCharSet)
+			buf.WriteByte(ea.charSet)
+			lastCS = ea.charSet
+		}
+
+		if ea.ge {
+			buf.WriteByte(orderGE)
+		}
+		buf.WriteByte(e.buffer[i])
+	}
 }
 
 // sendReadModified sends a Read Modified response. If all is true,
@@ -930,7 +1360,7 @@ func (e *Emulator) writeAllFields(buf *bytes.Buffer) {
 			buf.WriteByte(orderSBA)
 			buf.Write(addr[:])
 			for i := 0; i <= lastNonNull; i++ {
-				buf.WriteByte(e.buffer[i])
+				e.writeFieldDataByte(buf, i)
 			}
 		}
 		return
@@ -943,12 +1373,14 @@ func (e *Emulator) writeAllFields(buf *bytes.Buffer) {
 
 		dataStart := (i + 1) % e.size
 		var fieldData []byte
+		var geFlags []bool
 		cur := dataStart
 		for {
 			if e.isAttr[cur] {
 				break
 			}
 			fieldData = append(fieldData, e.buffer[cur])
+			geFlags = append(geFlags, e.extFields[cur].ge)
 			cur = (cur + 1) % e.size
 			if cur == dataStart {
 				break
@@ -956,15 +1388,21 @@ func (e *Emulator) writeAllFields(buf *bytes.Buffer) {
 		}
 
 		// Strip trailing nulls
-		for len(fieldData) > 0 && fieldData[len(fieldData)-1] == 0x00 {
+		for len(fieldData) > 0 && fieldData[len(fieldData)-1] == 0x00 && !geFlags[len(geFlags)-1] {
 			fieldData = fieldData[:len(fieldData)-1]
+			geFlags = geFlags[:len(geFlags)-1]
 		}
 
 		if len(fieldData) > 0 {
 			addr := encodeAddr(dataStart)
 			buf.WriteByte(orderSBA)
 			buf.Write(addr[:])
-			buf.Write(fieldData)
+			for j, b := range fieldData {
+				if geFlags[j] {
+					buf.WriteByte(orderGE)
+				}
+				buf.WriteByte(b)
+			}
 		}
 	}
 }
@@ -974,15 +1412,20 @@ func (e *Emulator) eraseScreen() {
 		e.buffer[i] = 0x00
 		e.fieldAttrs[i] = 0
 		e.isAttr[i] = false
+		e.extFields[i] = extAttrs{}
 	}
 	e.cursorAddr = 0
 	e.bufAddr = 0
+	e.replyMode = replyModeField
+	e.replyModeAttr = nil
+	e.resetCurrentSA()
 }
 
 func (e *Emulator) eraseUnprotected() {
 	for i := 0; i < e.size; i++ {
 		if !e.isAttr[i] && !e.isFieldProtectedAt(i) {
 			e.buffer[i] = 0x00
+			e.extFields[i] = extAttrs{}
 		}
 		if e.isAttr[i] && e.fieldAttrs[i]&attrProtected == 0 {
 			e.fieldAttrs[i] &^= attrMDT
@@ -991,8 +1434,12 @@ func (e *Emulator) eraseUnprotected() {
 	e.keyboardLock = false
 }
 
-// GetScreen returns the screen buffer as ASCII text (24 lines of 80 chars).
+// GetScreen returns the screen buffer as ASCII text.
 func (e *Emulator) GetScreen() string {
+	e2a := &ebcdicToASCII
+	if e.codePage != nil {
+		e2a = &e.codePage.EBCDICToASCII
+	}
 	var buf strings.Builder
 	buf.Grow(e.size + e.rows)
 	for row := 0; row < e.rows; row++ {
@@ -1005,7 +1452,7 @@ func (e *Emulator) GetScreen() string {
 				if ch == 0x00 {
 					buf.WriteByte(' ')
 				} else {
-					a := ebcdicToASCII[ch]
+					a := e2a[ch]
 					if a == 0x00 {
 						buf.WriteByte(' ')
 					} else {
@@ -1121,6 +1568,10 @@ func (e *Emulator) HasUnlockedField() bool {
 
 // TypeString places ASCII text into the screen buffer at the cursor position.
 func (e *Emulator) TypeString(text string) error {
+	a2e := &asciiToEBCDIC
+	if e.codePage != nil {
+		a2e = &e.codePage.ASCIIToEBCDIC
+	}
 	for _, ch := range []byte(text) {
 		if e.isAttr[e.cursorAddr] {
 			// Skip field attribute and advance to data position
@@ -1131,7 +1582,7 @@ func (e *Emulator) TypeString(text string) error {
 			return fmt.Errorf("cannot type in protected field at position %d", e.cursorAddr)
 		}
 
-		e.buffer[e.cursorAddr] = asciiToEBCDIC[ch]
+		e.buffer[e.cursorAddr] = a2e[ch]
 		e.setMDT(e.cursorAddr)
 
 		next := (e.cursorAddr + 1) % e.size
@@ -1173,6 +1624,14 @@ func (e *Emulator) sendAID(aid byte, timeout time.Duration) error {
 	return e.readUntilUnlocked(timeout)
 }
 
+// writeFieldDataByte writes a single field data byte, prefixing with GE if needed.
+func (e *Emulator) writeFieldDataByte(buf *bytes.Buffer, pos int) {
+	if e.extFields[pos].ge {
+		buf.WriteByte(orderGE)
+	}
+	buf.WriteByte(e.buffer[pos])
+}
+
 // writeModifiedFields appends SBA + field data for each modified field.
 func (e *Emulator) writeModifiedFields(buf *bytes.Buffer) {
 	if !e.isFormatted() {
@@ -1189,7 +1648,7 @@ func (e *Emulator) writeModifiedFields(buf *bytes.Buffer) {
 			buf.WriteByte(orderSBA)
 			buf.Write(addr[:])
 			for i := 0; i <= lastNonNull; i++ {
-				buf.WriteByte(e.buffer[i])
+				e.writeFieldDataByte(buf, i)
 			}
 		}
 		return
@@ -1205,28 +1664,36 @@ func (e *Emulator) writeModifiedFields(buf *bytes.Buffer) {
 
 		// Collect field data until next attribute
 		var fieldData []byte
+		var geFlags []bool
 		cur := dataStart
 		for {
 			if e.isAttr[cur] {
 				break
 			}
 			fieldData = append(fieldData, e.buffer[cur])
+			geFlags = append(geFlags, e.extFields[cur].ge)
 			cur = (cur + 1) % e.size
 			if cur == dataStart {
 				break
 			}
 		}
 
-		// Strip trailing nulls
-		for len(fieldData) > 0 && fieldData[len(fieldData)-1] == 0x00 {
+		// Strip trailing nulls (but not if GE-flagged)
+		for len(fieldData) > 0 && fieldData[len(fieldData)-1] == 0x00 && !geFlags[len(geFlags)-1] {
 			fieldData = fieldData[:len(fieldData)-1]
+			geFlags = geFlags[:len(geFlags)-1]
 		}
 
 		if len(fieldData) > 0 {
 			addr := encodeAddr(dataStart)
 			buf.WriteByte(orderSBA)
 			buf.Write(addr[:])
-			buf.Write(fieldData)
+			for j, b := range fieldData {
+				if geFlags[j] {
+					buf.WriteByte(orderGE)
+				}
+				buf.WriteByte(b)
+			}
 		}
 	}
 }

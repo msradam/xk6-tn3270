@@ -16,12 +16,28 @@ type Client struct {
 	emu       *Emulator
 	mu        sync.Mutex
 	connected bool
+	model     int
+	codePage  *CodePage
 }
 
 func NewClient(vu modules.VU) *Client {
 	return &Client{
 		vu: vu,
 	}
+}
+
+// newEmulator creates an Emulator with the client's configured model and code page.
+func (c *Client) newEmulator() *Emulator {
+	var emu *Emulator
+	if c.model > 0 {
+		emu = NewEmulatorModel(c.model)
+	} else {
+		emu = NewEmulator()
+	}
+	if c.codePage != nil {
+		emu.codePage = c.codePage
+	}
+	return emu
 }
 
 func (c *Client) checkConnected() error {
@@ -51,7 +67,7 @@ func (c *Client) Connect(host string, port int, timeout ...int) error {
 	}
 
 	c.mu.Lock()
-	c.emu = NewEmulator()
+	c.emu = c.newEmulator()
 	c.mu.Unlock()
 
 	if err := c.emu.Connect(host, port, time.Duration(timeoutSec)*time.Second); err != nil {
@@ -65,6 +81,70 @@ func (c *Client) Connect(host string, port int, timeout ...int) error {
 	c.connected = true
 	c.mu.Unlock()
 
+	return nil
+}
+
+// ConnectTLS establishes a TLS-encrypted TN3270 connection.
+func (c *Client) ConnectTLS(host string, port int, insecure bool, timeout ...int) error {
+	if host == "" {
+		return fmt.Errorf("host cannot be empty")
+	}
+	if len(host) > 253 {
+		return fmt.Errorf("host exceeds maximum length of 253 characters")
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535, got %d", port)
+	}
+
+	timeoutSec := 30
+	if len(timeout) > 0 && timeout[0] > 0 {
+		timeoutSec = timeout[0]
+	}
+	if timeoutSec < 1 || timeoutSec > 300 {
+		return fmt.Errorf("timeout must be between 1 and 300 seconds, got %d", timeoutSec)
+	}
+
+	c.mu.Lock()
+	c.emu = c.newEmulator()
+	c.emu.useTLS = true
+	c.emu.tlsInsecure = insecure
+	c.mu.Unlock()
+
+	if err := c.emu.Connect(host, port, time.Duration(timeoutSec)*time.Second); err != nil {
+		c.mu.Lock()
+		c.emu = nil
+		c.mu.Unlock()
+		return fmt.Errorf("failed to connect to %s:%d: %w", host, port, err)
+	}
+
+	c.mu.Lock()
+	c.connected = true
+	c.mu.Unlock()
+
+	return nil
+}
+
+// SetModel sets the terminal model (2-5). Must be called before Connect.
+func (c *Client) SetModel(model int) error {
+	if model < 2 || model > 5 {
+		return fmt.Errorf("model must be between 2 and 5, got %d", model)
+	}
+	c.mu.Lock()
+	c.model = model
+	c.mu.Unlock()
+	return nil
+}
+
+// SetCodePage sets the EBCDIC code page. Supported: "cp037" (default), "cp1047".
+// Must be called before Connect.
+func (c *Client) SetCodePage(name string) error {
+	cp, ok := CodePages[name]
+	if !ok {
+		return fmt.Errorf("unsupported code page: %s (supported: cp037, cp1047)", name)
+	}
+	c.mu.Lock()
+	c.codePage = cp
+	c.mu.Unlock()
 	return nil
 }
 
@@ -159,14 +239,14 @@ func (c *Client) Pa(key int) error {
 }
 
 func (c *Client) MoveTo(row, col int) error {
-	if row < 1 || row > 24 {
-		return fmt.Errorf("row must be between 1 and 24, got %d", row)
-	}
-	if col < 1 || col > 80 {
-		return fmt.Errorf("column must be between 1 and 80, got %d", col)
-	}
 	if err := c.checkConnected(); err != nil {
 		return err
+	}
+	if row < 1 || row > c.emu.rows {
+		return fmt.Errorf("row must be between 1 and %d, got %d", c.emu.rows, row)
+	}
+	if col < 1 || col > c.emu.cols {
+		return fmt.Errorf("column must be between 1 and %d, got %d", c.emu.cols, col)
 	}
 	c.emu.MoveCursor(row-1, col-1)
 	return nil

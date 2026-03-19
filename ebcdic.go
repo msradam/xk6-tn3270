@@ -1,90 +1,151 @@
 package tn3270
 
-// EBCDIC Code Page 037 (US/Canada) conversion tables.
+// CodePage represents an EBCDIC code page with bidirectional conversion tables.
+type CodePage struct {
+	Name          string
+	EBCDICToASCII [256]byte
+	ASCIIToEBCDIC [256]byte
+}
 
+// Default code page tables (CP037) — used by the emulator.
 var ebcdicToASCII [256]byte
 var asciiToEBCDIC [256]byte
 
+// Available code pages.
+var CodePages map[string]*CodePage
+
 func init() {
-	// Default: unmapped EBCDIC codes display as space
-	for i := range ebcdicToASCII {
-		ebcdicToASCII[i] = ' '
-	}
-	ebcdicToASCII[0x00] = 0x00 // NUL
+	CodePages = make(map[string]*CodePage)
 
-	// Space
-	ebcdicToASCII[0x40] = ' '
+	cp037 := buildCP037()
+	CodePages["cp037"] = cp037
+	CodePages["037"] = cp037
 
-	// Punctuation and special characters
-	ebcdicToASCII[0x4B] = '.'
-	ebcdicToASCII[0x4C] = '<'
-	ebcdicToASCII[0x4D] = '('
-	ebcdicToASCII[0x4E] = '+'
-	ebcdicToASCII[0x4F] = '|'
-	ebcdicToASCII[0x50] = '&'
-	ebcdicToASCII[0x5A] = '!'
-	ebcdicToASCII[0x5B] = '$'
-	ebcdicToASCII[0x5C] = '*'
-	ebcdicToASCII[0x5D] = ')'
-	ebcdicToASCII[0x5E] = ';'
-	ebcdicToASCII[0x5F] = '^'
-	ebcdicToASCII[0x60] = '-'
-	ebcdicToASCII[0x61] = '/'
-	ebcdicToASCII[0x6B] = ','
-	ebcdicToASCII[0x6C] = '%'
-	ebcdicToASCII[0x6D] = '_'
-	ebcdicToASCII[0x6E] = '>'
-	ebcdicToASCII[0x6F] = '?'
-	ebcdicToASCII[0x79] = '`'
-	ebcdicToASCII[0x7A] = ':'
-	ebcdicToASCII[0x7B] = '#'
-	ebcdicToASCII[0x7C] = '@'
-	ebcdicToASCII[0x7D] = '\''
-	ebcdicToASCII[0x7E] = '='
-	ebcdicToASCII[0x7F] = '"'
-	ebcdicToASCII[0xA1] = '~'
-	ebcdicToASCII[0xC0] = '{'
-	ebcdicToASCII[0xD0] = '}'
-	ebcdicToASCII[0xE0] = '\\'
+	cp1047 := buildCP1047()
+	CodePages["cp1047"] = cp1047
+	CodePages["1047"] = cp1047
 
-	// Lowercase a-i (0x81-0x89)
-	for i := byte(0); i < 9; i++ {
-		ebcdicToASCII[0x81+i] = 'a' + i
+	// Set default
+	ebcdicToASCII = cp037.EBCDICToASCII
+	asciiToEBCDIC = cp037.ASCIIToEBCDIC
+}
+
+// buildCodePage creates a CodePage from a mapping of EBCDIC→ASCII values.
+func buildCodePage(name string, mapping map[byte]byte) *CodePage {
+	cp := &CodePage{Name: name}
+	for i := range cp.EBCDICToASCII {
+		cp.EBCDICToASCII[i] = ' '
 	}
-	// Lowercase j-r (0x91-0x99)
-	for i := byte(0); i < 9; i++ {
-		ebcdicToASCII[0x91+i] = 'j' + i
-	}
-	// Lowercase s-z (0xA2-0xA9)
-	for i := byte(0); i < 8; i++ {
-		ebcdicToASCII[0xA2+i] = 's' + i
+	cp.EBCDICToASCII[0x00] = 0x00
+
+	for e, a := range mapping {
+		cp.EBCDICToASCII[e] = a
 	}
 
-	// Uppercase A-I (0xC1-0xC9)
-	for i := byte(0); i < 9; i++ {
-		ebcdicToASCII[0xC1+i] = 'A' + i
-	}
-	// Uppercase J-R (0xD1-0xD9)
-	for i := byte(0); i < 9; i++ {
-		ebcdicToASCII[0xD1+i] = 'J' + i
-	}
-	// Uppercase S-Z (0xE2-0xE9)
-	for i := byte(0); i < 8; i++ {
-		ebcdicToASCII[0xE2+i] = 'S' + i
-	}
-
-	// Digits 0-9 (0xF0-0xF9)
-	for i := byte(0); i < 10; i++ {
-		ebcdicToASCII[0xF0+i] = '0' + i
-	}
-
-	// Build reverse mapping (ASCII → EBCDIC)
+	// Build reverse mapping
 	for e := 0; e < 256; e++ {
-		a := ebcdicToASCII[e]
-		if a != ' ' && a != 0x00 && asciiToEBCDIC[a] == 0x00 {
-			asciiToEBCDIC[a] = byte(e)
+		a := cp.EBCDICToASCII[e]
+		if a != ' ' && a != 0x00 && cp.ASCIIToEBCDIC[a] == 0x00 {
+			cp.ASCIIToEBCDIC[a] = byte(e)
 		}
 	}
-	asciiToEBCDIC[' '] = 0x40
-	asciiToEBCDIC[0x00] = 0x00
+	cp.ASCIIToEBCDIC[' '] = 0x40
+	cp.ASCIIToEBCDIC[0x00] = 0x00
+	return cp
+}
+
+// buildCP037 builds Code Page 037 (US/Canada).
+func buildCP037() *CodePage {
+	m := map[byte]byte{
+		0x40: ' ',
+		0x4B: '.', 0x4C: '<', 0x4D: '(', 0x4E: '+', 0x4F: '|',
+		0x50: '&',
+		0x5A: '!', 0x5B: '$', 0x5C: '*', 0x5D: ')', 0x5E: ';',
+		0x5F: '^',
+		0x60: '-', 0x61: '/',
+		0x6B: ',', 0x6C: '%', 0x6D: '_', 0x6E: '>', 0x6F: '?',
+		0x79: '`',
+		0x7A: ':', 0x7B: '#', 0x7C: '@', 0x7D: '\'', 0x7E: '=', 0x7F: '"',
+		0xA1: '~',
+		0xC0: '{', 0xD0: '}', 0xE0: '\\',
+	}
+	// Lowercase a-i
+	for i := byte(0); i < 9; i++ {
+		m[0x81+i] = 'a' + i
+	}
+	// Lowercase j-r
+	for i := byte(0); i < 9; i++ {
+		m[0x91+i] = 'j' + i
+	}
+	// Lowercase s-z
+	for i := byte(0); i < 8; i++ {
+		m[0xA2+i] = 's' + i
+	}
+	// Uppercase A-I
+	for i := byte(0); i < 9; i++ {
+		m[0xC1+i] = 'A' + i
+	}
+	// Uppercase J-R
+	for i := byte(0); i < 9; i++ {
+		m[0xD1+i] = 'J' + i
+	}
+	// Uppercase S-Z
+	for i := byte(0); i < 8; i++ {
+		m[0xE2+i] = 'S' + i
+	}
+	// Digits 0-9
+	for i := byte(0); i < 10; i++ {
+		m[0xF0+i] = '0' + i
+	}
+	return buildCodePage("cp037", m)
+}
+
+// buildCP1047 builds Code Page 1047 (z/OS default, Latin-1/Open Systems).
+// CP1047 differs from CP037 mainly in bracket/brace/tilde positions.
+func buildCP1047() *CodePage {
+	m := map[byte]byte{
+		0x40: ' ',
+		0x4B: '.', 0x4C: '<', 0x4D: '(', 0x4E: '+', 0x4F: '|',
+		0x50: '&',
+		0x5A: '!', 0x5B: '$', 0x5C: '*', 0x5D: ')', 0x5E: ';',
+		0x5F: '^',
+		0x60: '-', 0x61: '/',
+		0x6B: ',', 0x6C: '%', 0x6D: '_', 0x6E: '>', 0x6F: '?',
+		0x79: '`',
+		0x7A: ':', 0x7B: '#', 0x7C: '@', 0x7D: '\'', 0x7E: '=', 0x7F: '"',
+		// CP1047 specific mappings (differs from CP037):
+		0xA1: '~',
+		0xAD: '[', 0xBD: ']',
+		0xC0: '{', 0xD0: '}',
+		0xE0: '\\',
+	}
+	// Lowercase a-i
+	for i := byte(0); i < 9; i++ {
+		m[0x81+i] = 'a' + i
+	}
+	// Lowercase j-r
+	for i := byte(0); i < 9; i++ {
+		m[0x91+i] = 'j' + i
+	}
+	// Lowercase s-z
+	for i := byte(0); i < 8; i++ {
+		m[0xA2+i] = 's' + i
+	}
+	// Uppercase A-I
+	for i := byte(0); i < 9; i++ {
+		m[0xC1+i] = 'A' + i
+	}
+	// Uppercase J-R
+	for i := byte(0); i < 9; i++ {
+		m[0xD1+i] = 'J' + i
+	}
+	// Uppercase S-Z
+	for i := byte(0); i < 8; i++ {
+		m[0xE2+i] = 'S' + i
+	}
+	// Digits 0-9
+	for i := byte(0); i < 10; i++ {
+		m[0xF0+i] = '0' + i
+	}
+	return buildCodePage("cp1047", m)
 }

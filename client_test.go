@@ -280,31 +280,31 @@ func TestMoveToValidation(t *testing.T) {
 			name:        "row too low",
 			row:         0,
 			col:         1,
-			expectError: "row must be between 1 and 24",
+			expectError: "row must be between 1 and",
 		},
 		{
 			name:        "row too high",
 			row:         25,
 			col:         1,
-			expectError: "row must be between 1 and 24",
+			expectError: "row must be between 1 and",
 		},
 		{
 			name:        "col too low",
 			row:         1,
 			col:         0,
-			expectError: "column must be between 1 and 80",
+			expectError: "column must be between 1 and",
 		},
 		{
 			name:        "col too high",
 			row:         1,
 			col:         81,
-			expectError: "column must be between 1 and 80",
+			expectError: "column must be between 1 and",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Client{}
+			c := &Client{emu: NewEmulator(), connected: true}
 			err := c.MoveTo(tt.row, tt.col)
 
 			if err == nil {
@@ -637,6 +637,280 @@ func TestSNACommandVariants(t *testing.T) {
 
 	if emu.keyboardLock {
 		t.Error("expected keyboard unlocked after SNA EraseWrite with unlock WCC")
+	}
+}
+
+func TestExtendedAttributeTracking(t *testing.T) {
+	emu := NewEmulator()
+
+	// SFE with highlight + color attributes
+	data := []byte{
+		cmdEraseWrite,
+		wccUnlock | wccResetMDT,
+		orderSBA, addrTable[0], addrTable[0],
+		orderSFE, 0x03, // 3 attribute pairs
+		extAttrBasic, 0x00, // unprotected
+		extAttrHighlight, 0xF2, // reverse video
+		extAttrColor, 0xF2, // red
+		0xC8, 0xC5, 0xD3, 0xD3, 0xD6, // HELLO
+	}
+
+	err := emu.processMessage(data)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	// Field attr position should have extended attributes
+	if emu.extFields[0].highlight != 0xF2 {
+		t.Errorf("expected highlight 0xF2, got 0x%02X", emu.extFields[0].highlight)
+	}
+	if emu.extFields[0].color != 0xF2 {
+		t.Errorf("expected color 0xF2, got 0x%02X", emu.extFields[0].color)
+	}
+
+	screen := emu.GetScreen()
+	if !strings.Contains(screen, "HELLO") {
+		t.Errorf("expected screen to contain 'HELLO', got:\n%s", screen)
+	}
+}
+
+func TestSAOrderTracking(t *testing.T) {
+	emu := NewEmulator()
+
+	// Write with SA orders setting color
+	data := []byte{
+		cmdEraseWrite,
+		wccUnlock | wccResetMDT,
+		orderSBA, addrTable[0], addrTable[0],
+		orderSF, 0x00, // unprotected field
+		orderSA, extAttrColor, 0xF4, // Set color to green
+		0xC8, 0xC5, 0xD3, 0xD3, 0xD6, // HELLO
+	}
+
+	err := emu.processMessage(data)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	// Data positions after SA should have the color set
+	if emu.extFields[1].color != 0xF4 {
+		t.Errorf("expected color 0xF4 at pos 1, got 0x%02X", emu.extFields[1].color)
+	}
+}
+
+func TestReplyModeTracking(t *testing.T) {
+	emu := NewEmulator()
+
+	// Default should be field mode
+	if emu.replyMode != replyModeField {
+		t.Errorf("expected default reply mode 0x00, got 0x%02X", emu.replyMode)
+	}
+
+	// Set to character mode via WSF
+	emu.handleSetReplyMode([]byte{0x00, replyModeChar, extAttrHighlight, extAttrColor})
+
+	if emu.replyMode != replyModeChar {
+		t.Errorf("expected reply mode 0x02 (character), got 0x%02X", emu.replyMode)
+	}
+	if len(emu.replyModeAttr) != 2 {
+		t.Errorf("expected 2 reply mode attrs, got %d", len(emu.replyModeAttr))
+	}
+
+	// Set to extended field mode
+	emu.handleSetReplyMode([]byte{0x00, replyModeExtField})
+	if emu.replyMode != replyModeExtField {
+		t.Errorf("expected reply mode 0x01 (ext field), got 0x%02X", emu.replyMode)
+	}
+}
+
+func TestReadBufferExtendedFieldMode(t *testing.T) {
+	emu := NewEmulator()
+	emu.lastAID = aidEnter
+	emu.replyMode = replyModeExtField
+
+	// Set up field with extended attributes
+	emu.isAttr[0] = true
+	emu.fieldAttrs[0] = 0x00
+	emu.extFields[0] = extAttrs{highlight: 0xF2, color: 0xF4}
+	emu.buffer[1] = asciiToEBCDIC['A']
+	emu.cursorAddr = 2
+
+	// Build response manually
+	var buf bytes.Buffer
+	buf.WriteByte(aidEnter)
+	addr := encodeAddr(2)
+	buf.Write(addr[:])
+
+	// In ext field mode, field attrs should use SFE
+	for i := 0; i < emu.size; i++ {
+		if emu.isAttr[i] {
+			emu.writeSFE(&buf, i)
+		} else {
+			if emu.extFields[i].ge {
+				buf.WriteByte(orderGE)
+			}
+			buf.WriteByte(emu.buffer[i])
+		}
+	}
+
+	result := buf.Bytes()
+	// First 3 bytes: AID + cursor addr
+	// Then should be SFE order (0x29)
+	if result[3] != orderSFE {
+		t.Errorf("expected SFE (0x29) in ext field mode, got 0x%02X", result[3])
+	}
+}
+
+func TestCharacterModeReadBuffer(t *testing.T) {
+	emu := NewEmulator()
+	emu.lastAID = aidEnter
+	emu.replyMode = replyModeChar
+
+	// Set up field with data that has varying colors
+	emu.isAttr[0] = true
+	emu.fieldAttrs[0] = 0x00
+	emu.buffer[1] = asciiToEBCDIC['A']
+	emu.extFields[1] = extAttrs{color: 0xF2} // red
+	emu.buffer[2] = asciiToEBCDIC['B']
+	emu.extFields[2] = extAttrs{color: 0xF4} // green
+	emu.cursorAddr = 3
+
+	var buf bytes.Buffer
+	emu.writeCharacterModeBuffer(&buf)
+	result := buf.Bytes()
+
+	// Should contain SA orders between positions with different colors
+	hasSA := false
+	for i := 0; i < len(result)-2; i++ {
+		if result[i] == orderSA {
+			hasSA = true
+			break
+		}
+	}
+	if !hasSA {
+		t.Error("expected SA orders in character mode buffer, found none")
+	}
+}
+
+func TestAlternateScreenSize(t *testing.T) {
+	// Model 5 has alternate size 27×132
+	emu := NewEmulatorModel(5)
+
+	if emu.defRows != 24 || emu.defCols != 80 {
+		t.Errorf("expected default 24×80, got %d×%d", emu.defRows, emu.defCols)
+	}
+	if emu.altRows != 27 || emu.altCols != 132 {
+		t.Errorf("expected alt 27×132, got %d×%d", emu.altRows, emu.altCols)
+	}
+
+	// Default starts at 24×80
+	if emu.rows != 24 || emu.cols != 80 {
+		t.Errorf("expected initial 24×80, got %d×%d", emu.rows, emu.cols)
+	}
+
+	// EraseWriteAlt should switch to alternate size
+	data := []byte{cmdEraseWriteAlt, wccUnlock | wccResetMDT}
+	err := emu.processMessage(data)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	if emu.rows != 27 || emu.cols != 132 {
+		t.Errorf("expected 27×132 after EraseWriteAlt, got %d×%d", emu.rows, emu.cols)
+	}
+
+	// Regular EraseWrite should switch back to default
+	data = []byte{cmdEraseWrite, wccUnlock | wccResetMDT}
+	err = emu.processMessage(data)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	if emu.rows != 24 || emu.cols != 80 {
+		t.Errorf("expected 24×80 after EraseWrite, got %d×%d", emu.rows, emu.cols)
+	}
+}
+
+func TestGETracking(t *testing.T) {
+	emu := NewEmulator()
+
+	data := []byte{
+		cmdEraseWrite,
+		wccUnlock | wccResetMDT,
+		orderSBA, addrTable[0], addrTable[0],
+		orderSF, 0x00,
+		orderGE, 0xC1, // GE 'A'
+		0xC2, // regular 'B'
+	}
+
+	err := emu.processMessage(data)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	if !emu.extFields[1].ge {
+		t.Error("expected GE flag set at position 1")
+	}
+	if emu.extFields[2].ge {
+		t.Error("expected GE flag NOT set at position 2")
+	}
+}
+
+func TestCodePageCP1047(t *testing.T) {
+	cp := CodePages["cp1047"]
+	if cp == nil {
+		t.Fatal("cp1047 not found in CodePages")
+	}
+
+	// Verify bracket mappings specific to CP1047
+	if cp.EBCDICToASCII[0xAD] != '[' {
+		t.Errorf("CP1047: expected 0xAD -> '[', got %c", cp.EBCDICToASCII[0xAD])
+	}
+	if cp.EBCDICToASCII[0xBD] != ']' {
+		t.Errorf("CP1047: expected 0xBD -> ']', got %c", cp.EBCDICToASCII[0xBD])
+	}
+
+	// Verify round-trip for common chars
+	for _, ch := range []byte("ABCabc012") {
+		ebcdic := cp.ASCIIToEBCDIC[ch]
+		back := cp.EBCDICToASCII[ebcdic]
+		if back != ch {
+			t.Errorf("CP1047 round-trip failed for '%c': ebcdic=0x%02X, back='%c'", ch, ebcdic, back)
+		}
+	}
+}
+
+func TestConnectionStateTransitions(t *testing.T) {
+	emu := NewEmulator()
+
+	if emu.connState != connNotConnected {
+		t.Errorf("expected connNotConnected, got %d", emu.connState)
+	}
+}
+
+func TestSetModelValidation(t *testing.T) {
+	c := &Client{}
+	if err := c.SetModel(1); err == nil {
+		t.Error("expected error for model 1")
+	}
+	if err := c.SetModel(6); err == nil {
+		t.Error("expected error for model 6")
+	}
+	if err := c.SetModel(3); err != nil {
+		t.Errorf("expected no error for model 3, got %v", err)
+	}
+}
+
+func TestSetCodePageValidation(t *testing.T) {
+	c := &Client{}
+	if err := c.SetCodePage("cp037"); err != nil {
+		t.Errorf("expected no error for cp037, got %v", err)
+	}
+	if err := c.SetCodePage("cp1047"); err != nil {
+		t.Errorf("expected no error for cp1047, got %v", err)
+	}
+	if err := c.SetCodePage("invalid"); err == nil {
+		t.Error("expected error for invalid code page")
 	}
 }
 
