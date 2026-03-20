@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -204,10 +206,10 @@ type termModel struct {
 }
 
 var termModels = map[int]termModel{
-	2: {name: "IBM-3278-2-E", rows: 24, cols: 80, altRows: 24, altCols: 80},
-	3: {name: "IBM-3278-3-E", rows: 24, cols: 80, altRows: 32, altCols: 80},
-	4: {name: "IBM-3278-4-E", rows: 24, cols: 80, altRows: 43, altCols: 80},
-	5: {name: "IBM-3278-5-E", rows: 24, cols: 80, altRows: 27, altCols: 132},
+	2: {name: "IBM-3278-2", rows: 24, cols: 80, altRows: 24, altCols: 80},
+	3: {name: "IBM-3278-3", rows: 24, cols: 80, altRows: 32, altCols: 80},
+	4: {name: "IBM-3278-4", rows: 24, cols: 80, altRows: 43, altCols: 80},
+	5: {name: "IBM-3278-5", rows: 24, cols: 80, altRows: 27, altCols: 132},
 }
 
 // TN3270E subnegotiation constants (RFC 2355).
@@ -290,6 +292,9 @@ type Emulator struct {
 
 	// Code page
 	codePage *CodePage
+
+	// Debug tracing
+	trace bool
 }
 
 func NewEmulator() *Emulator {
@@ -435,6 +440,28 @@ func (e *Emulator) readMessage() ([]byte, error) {
 						copy(e.tn3270eRespHdr[:], data[:5])
 						data = data[5:]
 						dataType := e.tn3270eRespHdr[0]
+						if e.trace {
+							dtName := fmt.Sprintf("0x%02X", dataType)
+							switch dataType {
+							case tn3270eData3270:
+								dtName = "3270-DATA"
+							case tn3270eSCSData:
+								dtName = "SCS-DATA"
+							case tn3270eResponse:
+								dtName = "RESPONSE"
+							case tn3270eBindImage:
+								dtName = "BIND-IMAGE"
+							case tn3270eUnbind:
+								dtName = "UNBIND"
+							case tn3270eNVTData:
+								dtName = "NVT-DATA"
+							case tn3270eSSCPLUData:
+								dtName = "SSCP-LU-DATA"
+							}
+							log.Printf("[TN3270E] RECV header: type=%s req=0x%02X resp=0x%02X seq=%d datalen=%d",
+								dtName, e.tn3270eRespHdr[1], e.tn3270eRespHdr[2],
+								int(e.tn3270eRespHdr[3])<<8|int(e.tn3270eRespHdr[4]), len(data))
+						}
 						switch dataType {
 						case tn3270eData3270:
 							// Fall through to return data
@@ -446,6 +473,9 @@ func (e *Emulator) readMessage() ([]byte, error) {
 							return nil, nil
 						}
 					} else {
+						if e.trace {
+							log.Printf("[TN3270E] RECV short record (%d bytes), skipping", len(data))
+						}
 						// Short TN3270E record (< 5 bytes); skip
 						return nil, nil
 					}
@@ -510,11 +540,34 @@ func (e *Emulator) processAndRespond(msg []byte) error {
 	return nil
 }
 
+func (e *Emulator) telnetOptName(opt byte) string {
+	switch opt {
+	case telnetOptBinary:
+		return "BINARY"
+	case telnetOptSGA:
+		return "SGA"
+	case telnetOptTermType:
+		return "TERMINAL-TYPE"
+	case telnetOptEOR:
+		return "EOR"
+	case telnetOptTN3270E:
+		return "TN3270E"
+	default:
+		return fmt.Sprintf("0x%02X", opt)
+	}
+}
+
 func (e *Emulator) handleTelnetDo(opt byte) error {
 	switch opt {
 	case telnetOptTermType, telnetOptEOR, telnetOptBinary, telnetOptTN3270E, telnetOptSGA:
+		if e.trace {
+			log.Printf("[TN3270] RECV DO %s → SEND WILL %s", e.telnetOptName(opt), e.telnetOptName(opt))
+		}
 		return e.sendTelnet(telnetIAC, telnetWILL, opt)
 	default:
+		if e.trace {
+			log.Printf("[TN3270] RECV DO %s → SEND WONT %s", e.telnetOptName(opt), e.telnetOptName(opt))
+		}
 		return e.sendTelnet(telnetIAC, telnetWONT, opt)
 	}
 }
@@ -522,8 +575,14 @@ func (e *Emulator) handleTelnetDo(opt byte) error {
 func (e *Emulator) handleTelnetWill(opt byte) error {
 	switch opt {
 	case telnetOptEOR, telnetOptBinary, telnetOptTN3270E, telnetOptSGA:
+		if e.trace {
+			log.Printf("[TN3270] RECV WILL %s → SEND DO %s", e.telnetOptName(opt), e.telnetOptName(opt))
+		}
 		return e.sendTelnet(telnetIAC, telnetDO, opt)
 	default:
+		if e.trace {
+			log.Printf("[TN3270] RECV WILL %s → SEND DONT %s", e.telnetOptName(opt), e.telnetOptName(opt))
+		}
 		return e.sendTelnet(telnetIAC, telnetDONT, opt)
 	}
 }
@@ -553,6 +612,9 @@ func (e *Emulator) handleSubnegotiation() error {
 
 	if len(subData) >= 2 && subData[0] == telnetOptTermType && subData[1] == telnetTermTypeSend {
 		tm := termModels[e.model]
+		if e.trace {
+			log.Printf("[TN3270] RECV SB TERMINAL-TYPE SEND → SEND IS %s", tm.name)
+		}
 		resp := []byte{telnetIAC, telnetSB, telnetOptTermType, telnetTermTypeIs}
 		resp = append(resp, []byte(tm.name)...)
 		resp = append(resp, telnetIAC, telnetSE)
@@ -564,6 +626,9 @@ func (e *Emulator) handleSubnegotiation() error {
 		return e.handleTN3270ESub(subData[1:])
 	}
 
+	if e.trace {
+		log.Printf("[TN3270] RECV SB unknown: %s", hex.EncodeToString(subData))
+	}
 	return nil
 }
 
@@ -577,6 +642,9 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 		// SEND DEVICE-TYPE: respond with DEVICE-TYPE REQUEST <term-type>
 		if len(data) >= 2 && data[1] == tn3270eDeviceType {
 			tm := termModels[e.model]
+			if e.trace {
+				log.Printf("[TN3270E] RECV SEND DEVICE-TYPE → REQUEST %s", tm.name)
+			}
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eDeviceType, tn3270eRequest}
 			resp = append(resp, []byte(tm.name)...)
 			resp = append(resp, telnetIAC, telnetSE)
@@ -593,6 +661,9 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 			// DEVICE-TYPE IS: server acknowledged device type.
 			// Client must now send FUNCTIONS REQUEST to complete TN3270E negotiation.
 			// Request RESPONSES function for proper acknowledgement support.
+			if e.trace {
+				log.Printf("[TN3270E] RECV DEVICE-TYPE IS → SEND FUNCTIONS REQUEST [RESPONSES]")
+			}
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eRequest,
 				tn3270eFuncResponses,
 				telnetIAC, telnetSE}
@@ -601,6 +672,9 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 		case 0x06: // REJECT
 			// Server rejected our device type or TN3270E entirely.
 			// Fall back to plain TN3270 by sending WONT TN3270E.
+			if e.trace {
+				log.Printf("[TN3270E] RECV DEVICE-TYPE REJECT → falling back to TN3270")
+			}
 			e.connState = connTN3270
 			return e.sendTelnet(telnetIAC, telnetWONT, telnetOptTN3270E)
 		}
@@ -621,6 +695,9 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 					e.tn3270eResponses = true
 				}
 			}
+			if e.trace {
+				log.Printf("[TN3270E] RECV FUNCTIONS IS (responses=%v) → TN3270E active", e.tn3270eResponses)
+			}
 		case tn3270eRequest:
 			// Server sent FUNCTIONS REQUEST with its preferred list.
 			// Intersect with what we support (only RESPONSES).
@@ -630,6 +707,9 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 					accepted = append(accepted, f)
 					e.tn3270eResponses = true
 				}
+			}
+			if e.trace {
+				log.Printf("[TN3270E] RECV FUNCTIONS REQUEST → SEND FUNCTIONS IS (responses=%v)", e.tn3270eResponses)
 			}
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eIs}
 			resp = append(resp, accepted...)
@@ -641,6 +721,9 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 			e.connState = connTN3270E
 		case 0x06: // REJECT
 			// Fall back to plain TN3270.
+			if e.trace {
+				log.Printf("[TN3270E] RECV FUNCTIONS REJECT → falling back to TN3270")
+			}
 			e.connState = connTN3270
 			return e.sendTelnet(telnetIAC, telnetWONT, telnetOptTN3270E)
 		}
@@ -672,6 +755,22 @@ func (e *Emulator) sendRecord(data []byte) error {
 // sendData sends 3270 data framed with IAC EOR, escaping any 0xFF bytes.
 // In TN3270E mode, a 5-byte header is prepended.
 func (e *Emulator) sendData(data []byte) error {
+	if e.trace {
+		aidName := fmt.Sprintf("0x%02X", data[0])
+		switch data[0] {
+		case aidEnter:
+			aidName = "Enter"
+		case aidClear:
+			aidName = "Clear"
+		case aidSF:
+			aidName = "SF(QueryReply)"
+		}
+		if len(data) <= 256 {
+			log.Printf("[3270] SEND aid=%s len=%d data=%s", aidName, len(data), hex.EncodeToString(data))
+		} else {
+			log.Printf("[3270] SEND aid=%s len=%d data=%s... (%d bytes)", aidName, len(data), hex.EncodeToString(data[:256]), len(data))
+		}
+	}
 	if e.tn3270e {
 		header := [5]byte{tn3270eData3270, 0x00, 0x00, byte((e.seqNum >> 8) & 0xFF), byte(e.seqNum & 0xFF)}
 		e.seqNum++
@@ -702,6 +801,34 @@ func (e *Emulator) processMessage(data []byte) error {
 	}
 
 	cmd := data[0]
+
+	if e.trace {
+		cmdName := fmt.Sprintf("0x%02X", cmd)
+		switch cmd {
+		case cmdWrite, cmdWriteSNA:
+			cmdName = "Write"
+		case cmdEraseWrite, cmdEraseWriteSNA:
+			cmdName = "EraseWrite"
+		case cmdEraseWriteAlt, cmdEraseWriteAltSNA:
+			cmdName = "EraseWriteAlt"
+		case cmdWSF, cmdWSFSNA:
+			cmdName = "WSF"
+		case cmdReadBuffer, cmdReadBufferSNA:
+			cmdName = "ReadBuffer"
+		case cmdReadMod, cmdReadModSNA:
+			cmdName = "ReadModified"
+		case cmdReadModAll, cmdReadModAllSNA:
+			cmdName = "ReadModifiedAll"
+		case cmdEraseAllUnp, cmdEraseAllUnpSNA:
+			cmdName = "EraseAllUnprotected"
+		}
+		log.Printf("[3270] RECV cmd=%s len=%d", cmdName, len(data))
+		if len(data) <= 256 {
+			log.Printf("[3270] DATA %s", hex.EncodeToString(data))
+		} else {
+			log.Printf("[3270] DATA %s... (%d bytes)", hex.EncodeToString(data[:256]), len(data))
+		}
+	}
 
 	switch cmd {
 	case cmdEraseWrite, cmdEraseWriteSNA:
@@ -808,6 +935,9 @@ func (e *Emulator) resetMDT(wcc byte) {
 // before user input is allowed.
 func (e *Emulator) restoreKeyboard(wcc byte) {
 	if wcc&wccUnlock != 0 {
+		if e.trace {
+			log.Printf("[3270] WCC keyboard restore → unlocked")
+		}
 		e.keyboardLock = false
 		if e.connState == connPending {
 			if e.tn3270e {

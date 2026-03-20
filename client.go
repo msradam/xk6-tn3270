@@ -18,6 +18,7 @@ type Client struct {
 	connected bool
 	model     int
 	codePage  *CodePage
+	trace     bool
 }
 
 func NewClient(vu modules.VU) *Client {
@@ -37,7 +38,18 @@ func (c *Client) newEmulator() *Emulator {
 	if c.codePage != nil {
 		emu.codePage = c.codePage
 	}
+	emu.trace = c.trace
 	return emu
+}
+
+// SetTrace enables protocol-level debug tracing to stderr.
+func (c *Client) SetTrace(enabled bool) {
+	c.mu.Lock()
+	c.trace = enabled
+	if c.emu != nil {
+		c.emu.trace = enabled
+	}
+	c.mu.Unlock()
 }
 
 func (c *Client) checkConnected() error {
