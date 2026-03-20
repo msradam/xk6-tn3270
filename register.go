@@ -12,14 +12,19 @@ func init() {
 type RootModule struct{}
 
 type ModuleInstance struct {
-	vu modules.VU
+	vu      modules.VU
+	metrics *tn3270Metrics
 }
 
 var _ modules.Module = &RootModule{}
 var _ modules.Instance = &ModuleInstance{}
 
 func (*RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
-	return &ModuleInstance{vu: vu}
+	m, err := registerMetrics(vu.InitEnv().Registry)
+	if err != nil {
+		panic(err)
+	}
+	return &ModuleInstance{vu: vu, metrics: m}
 }
 
 func (mi *ModuleInstance) Exports() modules.Exports {
@@ -31,5 +36,5 @@ func (mi *ModuleInstance) Exports() modules.Exports {
 }
 
 func (mi *ModuleInstance) newTN3270() *Client {
-	return NewClient(mi.vu)
+	return NewClient(mi.vu, mi.metrics)
 }

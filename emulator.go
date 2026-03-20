@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+// TraceLogger is the interface used by the Emulator for protocol-level trace output.
+type TraceLogger interface {
+	Printf(format string, args ...interface{})
+}
+
 // Telnet protocol constants.
 const (
 	telnetIAC  byte = 0xFF
@@ -72,9 +77,11 @@ const (
 
 // Field attribute bits.
 const (
-	attrProtected byte = 0x20
-	attrNumeric   byte = 0x10
-	attrMDT       byte = 0x01
+	attrProtected  byte = 0x20
+	attrNumeric    byte = 0x10
+	attrDisplay    byte = 0x0C // bits 3-2: display characteristics
+	attrNonDisplay byte = 0x0C // when bits 3-2 = 11: non-display (hidden)
+	attrMDT        byte = 0x01
 )
 
 // WCC (Write Control Character) bits.
@@ -294,7 +301,8 @@ type Emulator struct {
 	codePage *CodePage
 
 	// Debug tracing
-	trace bool
+	trace  bool
+	logger TraceLogger
 }
 
 func NewEmulator() *Emulator {
@@ -306,6 +314,13 @@ func NewEmulatorModel(model int) *Emulator {
 		model = 2
 	}
 	return newEmulatorModel(model)
+}
+
+// logf writes a trace log message if tracing is enabled.
+func (e *Emulator) logf(format string, args ...interface{}) {
+	if e.trace && e.logger != nil {
+		e.logger.Printf(format, args...)
+	}
 }
 
 func newEmulatorModel(model int) *Emulator {
@@ -333,15 +348,19 @@ func newEmulatorModel(model int) *Emulator {
 	e.fieldAttrs = make([]byte, maxSize)
 	e.isAttr = make([]bool, maxSize)
 	e.extFields = make([]extAttrs, maxSize)
+	e.logger = log.Default()
 	return e
 }
 
 // Connect establishes a TN3270 connection to the given host and port.
 // Telnet negotiation and initial screen reading happen synchronously.
-func (e *Emulator) Connect(host string, port int, timeout time.Duration) error {
+func (e *Emulator) Connect(ctx context.Context, host string, port int, timeout time.Duration) error {
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	var conn net.Conn
 	var err error
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
+	defer dialCancel()
 
 	if e.useTLS {
 		tlsConf := &tls.Config{
@@ -349,12 +368,13 @@ func (e *Emulator) Connect(host string, port int, timeout time.Duration) error {
 			ServerName:         host,
 		}
 		dialer := &tls.Dialer{
-			NetDialer: &net.Dialer{Timeout: timeout},
+			NetDialer: &net.Dialer{},
 			Config:    tlsConf,
 		}
-		conn, err = dialer.DialContext(context.Background(), "tcp", addr)
+		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
 	} else {
-		conn, err = net.DialTimeout("tcp", addr, timeout)
+		dialer := &net.Dialer{}
+		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
 	}
 	if err != nil {
 		return fmt.Errorf("tcp connection failed: %w", err)
@@ -366,21 +386,35 @@ func (e *Emulator) Connect(host string, port int, timeout time.Duration) error {
 	e.connState = connPending
 	e.eraseScreen()
 
-	if err := e.handshake(timeout); err != nil {
+	if err := e.handshake(ctx, timeout); err != nil {
 		e.closeConn()
 		return err
 	}
 	return nil
 }
 
-func (e *Emulator) handshake(timeout time.Duration) error {
-	if err := e.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return fmt.Errorf("failed to set read deadline: %w", err)
-	}
+func (e *Emulator) handshake(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 
 	for e.keyboardLock {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("timeout during initial handshake")
+		}
+		if err := e.conn.SetReadDeadline(time.Now().Add(min(remaining, 500*time.Millisecond))); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
 		msg, err := e.readMessage()
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			return fmt.Errorf("failed during initial handshake: %w", err)
 		}
 		if err := e.processAndRespond(msg); err != nil {
@@ -388,9 +422,7 @@ func (e *Emulator) handshake(timeout time.Duration) error {
 		}
 	}
 
-	if err := e.conn.SetReadDeadline(time.Time{}); err != nil {
-		return fmt.Errorf("failed to clear read deadline: %w", err)
-	}
+	_ = e.conn.SetReadDeadline(time.Time{})
 	return nil
 }
 
@@ -458,7 +490,7 @@ func (e *Emulator) readMessage() ([]byte, error) {
 							case tn3270eSSCPLUData:
 								dtName = "SSCP-LU-DATA"
 							}
-							log.Printf("[TN3270E] RECV header: type=%s req=0x%02X resp=0x%02X seq=%d datalen=%d",
+							e.logf("[TN3270E] RECV header: type=%s req=0x%02X resp=0x%02X seq=%d datalen=%d",
 								dtName, e.tn3270eRespHdr[1], e.tn3270eRespHdr[2],
 								int(e.tn3270eRespHdr[3])<<8|int(e.tn3270eRespHdr[4]), len(data))
 						}
@@ -474,7 +506,7 @@ func (e *Emulator) readMessage() ([]byte, error) {
 						}
 					} else {
 						if e.trace {
-							log.Printf("[TN3270E] RECV short record (%d bytes), skipping", len(data))
+							e.logf("[TN3270E] RECV short record (%d bytes), skipping", len(data))
 						}
 						// Short TN3270E record (< 5 bytes); skip
 						return nil, nil
@@ -561,12 +593,12 @@ func (e *Emulator) handleTelnetDo(opt byte) error {
 	switch opt {
 	case telnetOptTermType, telnetOptEOR, telnetOptBinary, telnetOptTN3270E, telnetOptSGA:
 		if e.trace {
-			log.Printf("[TN3270] RECV DO %s → SEND WILL %s", e.telnetOptName(opt), e.telnetOptName(opt))
+			e.logf("[TN3270] RECV DO %s → SEND WILL %s", e.telnetOptName(opt), e.telnetOptName(opt))
 		}
 		return e.sendTelnet(telnetIAC, telnetWILL, opt)
 	default:
 		if e.trace {
-			log.Printf("[TN3270] RECV DO %s → SEND WONT %s", e.telnetOptName(opt), e.telnetOptName(opt))
+			e.logf("[TN3270] RECV DO %s → SEND WONT %s", e.telnetOptName(opt), e.telnetOptName(opt))
 		}
 		return e.sendTelnet(telnetIAC, telnetWONT, opt)
 	}
@@ -576,12 +608,12 @@ func (e *Emulator) handleTelnetWill(opt byte) error {
 	switch opt {
 	case telnetOptEOR, telnetOptBinary, telnetOptTN3270E, telnetOptSGA:
 		if e.trace {
-			log.Printf("[TN3270] RECV WILL %s → SEND DO %s", e.telnetOptName(opt), e.telnetOptName(opt))
+			e.logf("[TN3270] RECV WILL %s → SEND DO %s", e.telnetOptName(opt), e.telnetOptName(opt))
 		}
 		return e.sendTelnet(telnetIAC, telnetDO, opt)
 	default:
 		if e.trace {
-			log.Printf("[TN3270] RECV WILL %s → SEND DONT %s", e.telnetOptName(opt), e.telnetOptName(opt))
+			e.logf("[TN3270] RECV WILL %s → SEND DONT %s", e.telnetOptName(opt), e.telnetOptName(opt))
 		}
 		return e.sendTelnet(telnetIAC, telnetDONT, opt)
 	}
@@ -613,7 +645,7 @@ func (e *Emulator) handleSubnegotiation() error {
 	if len(subData) >= 2 && subData[0] == telnetOptTermType && subData[1] == telnetTermTypeSend {
 		tm := termModels[e.model]
 		if e.trace {
-			log.Printf("[TN3270] RECV SB TERMINAL-TYPE SEND → SEND IS %s", tm.name)
+			e.logf("[TN3270] RECV SB TERMINAL-TYPE SEND → SEND IS %s", tm.name)
 		}
 		resp := []byte{telnetIAC, telnetSB, telnetOptTermType, telnetTermTypeIs}
 		resp = append(resp, []byte(tm.name)...)
@@ -627,7 +659,7 @@ func (e *Emulator) handleSubnegotiation() error {
 	}
 
 	if e.trace {
-		log.Printf("[TN3270] RECV SB unknown: %s", hex.EncodeToString(subData))
+		e.logf("[TN3270] RECV SB unknown: %s", hex.EncodeToString(subData))
 	}
 	return nil
 }
@@ -643,7 +675,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 		if len(data) >= 2 && data[1] == tn3270eDeviceType {
 			tm := termModels[e.model]
 			if e.trace {
-				log.Printf("[TN3270E] RECV SEND DEVICE-TYPE → REQUEST %s", tm.name)
+				e.logf("[TN3270E] RECV SEND DEVICE-TYPE → REQUEST %s", tm.name)
 			}
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eDeviceType, tn3270eRequest}
 			resp = append(resp, []byte(tm.name)...)
@@ -662,7 +694,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 			// Client must now send FUNCTIONS REQUEST to complete TN3270E negotiation.
 			// Request RESPONSES function for proper acknowledgement support.
 			if e.trace {
-				log.Printf("[TN3270E] RECV DEVICE-TYPE IS → SEND FUNCTIONS REQUEST [RESPONSES]")
+				e.logf("[TN3270E] RECV DEVICE-TYPE IS → SEND FUNCTIONS REQUEST [RESPONSES]")
 			}
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eRequest,
 				tn3270eFuncResponses,
@@ -673,7 +705,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 			// Server rejected our device type or TN3270E entirely.
 			// Fall back to plain TN3270 by sending WONT TN3270E.
 			if e.trace {
-				log.Printf("[TN3270E] RECV DEVICE-TYPE REJECT → falling back to TN3270")
+				e.logf("[TN3270E] RECV DEVICE-TYPE REJECT → falling back to TN3270")
 			}
 			e.connState = connTN3270
 			return e.sendTelnet(telnetIAC, telnetWONT, telnetOptTN3270E)
@@ -696,7 +728,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 				}
 			}
 			if e.trace {
-				log.Printf("[TN3270E] RECV FUNCTIONS IS (responses=%v) → TN3270E active", e.tn3270eResponses)
+				e.logf("[TN3270E] RECV FUNCTIONS IS (responses=%v) → TN3270E active", e.tn3270eResponses)
 			}
 		case tn3270eRequest:
 			// Server sent FUNCTIONS REQUEST with its preferred list.
@@ -709,7 +741,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 				}
 			}
 			if e.trace {
-				log.Printf("[TN3270E] RECV FUNCTIONS REQUEST → SEND FUNCTIONS IS (responses=%v)", e.tn3270eResponses)
+				e.logf("[TN3270E] RECV FUNCTIONS REQUEST → SEND FUNCTIONS IS (responses=%v)", e.tn3270eResponses)
 			}
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eIs}
 			resp = append(resp, accepted...)
@@ -722,7 +754,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 		case 0x06: // REJECT
 			// Fall back to plain TN3270.
 			if e.trace {
-				log.Printf("[TN3270E] RECV FUNCTIONS REJECT → falling back to TN3270")
+				e.logf("[TN3270E] RECV FUNCTIONS REJECT → falling back to TN3270")
 			}
 			e.connState = connTN3270
 			return e.sendTelnet(telnetIAC, telnetWONT, telnetOptTN3270E)
@@ -766,9 +798,9 @@ func (e *Emulator) sendData(data []byte) error {
 			aidName = "SF(QueryReply)"
 		}
 		if len(data) <= 256 {
-			log.Printf("[3270] SEND aid=%s len=%d data=%s", aidName, len(data), hex.EncodeToString(data))
+			e.logf("[3270] SEND aid=%s len=%d data=%s", aidName, len(data), hex.EncodeToString(data))
 		} else {
-			log.Printf("[3270] SEND aid=%s len=%d data=%s... (%d bytes)", aidName, len(data), hex.EncodeToString(data[:256]), len(data))
+			e.logf("[3270] SEND aid=%s len=%d data=%s... (%d bytes)", aidName, len(data), hex.EncodeToString(data[:256]), len(data))
 		}
 	}
 	if e.tn3270e {
@@ -822,11 +854,11 @@ func (e *Emulator) processMessage(data []byte) error {
 		case cmdEraseAllUnp, cmdEraseAllUnpSNA:
 			cmdName = "EraseAllUnprotected"
 		}
-		log.Printf("[3270] RECV cmd=%s len=%d", cmdName, len(data))
+		e.logf("[3270] RECV cmd=%s len=%d", cmdName, len(data))
 		if len(data) <= 256 {
-			log.Printf("[3270] DATA %s", hex.EncodeToString(data))
+			e.logf("[3270] DATA %s", hex.EncodeToString(data))
 		} else {
-			log.Printf("[3270] DATA %s... (%d bytes)", hex.EncodeToString(data[:256]), len(data))
+			e.logf("[3270] DATA %s... (%d bytes)", hex.EncodeToString(data[:256]), len(data))
 		}
 	}
 
@@ -936,7 +968,7 @@ func (e *Emulator) resetMDT(wcc byte) {
 func (e *Emulator) restoreKeyboard(wcc byte) {
 	if wcc&wccUnlock != 0 {
 		if e.trace {
-			log.Printf("[3270] WCC keyboard restore → unlocked")
+			e.logf("[3270] WCC keyboard restore → unlocked")
 		}
 		e.keyboardLock = false
 		if e.connState == connPending {
@@ -1517,8 +1549,8 @@ func (e *Emulator) writeAllFields(buf *bytes.Buffer) {
 			}
 		}
 
-		// Strip trailing nulls
-		for len(fieldData) > 0 && fieldData[len(fieldData)-1] == 0x00 && !geFlags[len(geFlags)-1] {
+		// Strip trailing nulls and spaces
+		for len(fieldData) > 0 && (fieldData[len(fieldData)-1] == 0x00 || fieldData[len(fieldData)-1] == 0x40) && !geFlags[len(geFlags)-1] {
 			fieldData = fieldData[:len(fieldData)-1]
 			geFlags = geFlags[:len(geFlags)-1]
 		}
@@ -1564,6 +1596,16 @@ func (e *Emulator) eraseUnprotected() {
 	e.keyboardLock = false
 }
 
+// isFieldNonDisplay returns true if the field at pos has non-display attribute.
+// Non-display fields (like password fields) have display bits 3-2 = 11.
+func (e *Emulator) isFieldNonDisplay(pos int) bool {
+	attrPos := e.findFieldAttr(pos)
+	if attrPos < 0 {
+		return false
+	}
+	return e.fieldAttrs[attrPos]&attrDisplay == attrNonDisplay
+}
+
 // GetScreen returns the screen buffer as ASCII text.
 func (e *Emulator) GetScreen() string {
 	e2a := &ebcdicToASCII
@@ -1576,6 +1618,8 @@ func (e *Emulator) GetScreen() string {
 		for col := 0; col < e.cols; col++ {
 			pos := row*e.cols + col
 			if e.isAttr[pos] {
+				buf.WriteByte(' ')
+			} else if e.isFieldNonDisplay(pos) {
 				buf.WriteByte(' ')
 			} else {
 				ch := e.buffer[pos]
@@ -1732,7 +1776,7 @@ func (e *Emulator) TypeString(text string) error {
 }
 
 // sendAID sends an AID response (Enter, PF, PA, Clear) and reads the host reply.
-func (e *Emulator) sendAID(aid byte, timeout time.Duration) error {
+func (e *Emulator) sendAID(ctx context.Context, aid byte, timeout time.Duration) error {
 	e.lastAID = aid
 
 	var buf bytes.Buffer
@@ -1751,7 +1795,7 @@ func (e *Emulator) sendAID(aid byte, timeout time.Duration) error {
 	}
 
 	e.keyboardLock = true
-	return e.readUntilUnlocked(timeout)
+	return e.readUntilUnlocked(ctx, timeout)
 }
 
 // writeFieldDataByte writes a single field data byte, prefixing with GE if needed.
@@ -1808,8 +1852,10 @@ func (e *Emulator) writeModifiedFields(buf *bytes.Buffer) {
 			}
 		}
 
-		// Strip trailing nulls (but not if GE-flagged)
-		for len(fieldData) > 0 && fieldData[len(fieldData)-1] == 0x00 && !geFlags[len(geFlags)-1] {
+		// Strip trailing nulls and spaces (but not if GE-flagged).
+		// Nulls (0x00) are always stripped per 3270 protocol.
+		// Spaces (0x40) from host RA fill are stripped to match real terminal behavior.
+		for len(fieldData) > 0 && (fieldData[len(fieldData)-1] == 0x00 || fieldData[len(fieldData)-1] == 0x40) && !geFlags[len(geFlags)-1] {
 			fieldData = fieldData[:len(fieldData)-1]
 			geFlags = geFlags[:len(geFlags)-1]
 		}
@@ -1829,17 +1875,31 @@ func (e *Emulator) writeModifiedFields(buf *bytes.Buffer) {
 }
 
 // readUntilUnlocked reads 3270 messages until the keyboard is unlocked.
-func (e *Emulator) readUntilUnlocked(timeout time.Duration) error {
-	if err := e.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return fmt.Errorf("failed to set read deadline: %w", err)
-	}
+func (e *Emulator) readUntilUnlocked(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	defer func() {
-		_ = e.conn.SetReadDeadline(time.Time{}) // best-effort clear
+		_ = e.conn.SetReadDeadline(time.Time{})
 	}()
 
 	for e.keyboardLock {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("timeout waiting for host response")
+		}
+		if err := e.conn.SetReadDeadline(time.Now().Add(min(remaining, 500*time.Millisecond))); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
 		msg, err := e.readMessage()
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			return fmt.Errorf("failed to read host response: %w", err)
 		}
 		if err := e.processAndRespond(msg); err != nil {
@@ -1850,25 +1910,31 @@ func (e *Emulator) readUntilUnlocked(timeout time.Duration) error {
 }
 
 // WaitForField waits until the keyboard is unlocked and an input field is available.
-func (e *Emulator) WaitForField(timeout time.Duration) error {
+func (e *Emulator) WaitForField(ctx context.Context, timeout time.Duration) error {
 	if e.HasUnlockedField() {
 		return nil
 	}
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			break
 		}
-		if err := e.conn.SetReadDeadline(time.Now().Add(remaining)); err != nil {
+		if err := e.conn.SetReadDeadline(time.Now().Add(min(remaining, 500*time.Millisecond))); err != nil {
 			return fmt.Errorf("failed to set read deadline: %w", err)
 		}
 		msg, err := e.readMessage()
-		_ = e.conn.SetReadDeadline(time.Time{}) // best-effort clear
+		_ = e.conn.SetReadDeadline(time.Time{})
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				return fmt.Errorf("timeout waiting for input field")
+				continue
 			}
 			return err
 		}
@@ -1883,24 +1949,24 @@ func (e *Emulator) WaitForField(timeout time.Duration) error {
 }
 
 // Enter sends the Enter AID key.
-func (e *Emulator) Enter(timeout time.Duration) error {
-	return e.sendAID(aidEnter, timeout)
+func (e *Emulator) Enter(ctx context.Context, timeout time.Duration) error {
+	return e.sendAID(ctx, aidEnter, timeout)
 }
 
 // PF sends a PF key (1-24).
-func (e *Emulator) PF(key int, timeout time.Duration) error {
-	return e.sendAID(pfAIDs[key-1], timeout)
+func (e *Emulator) PF(ctx context.Context, key int, timeout time.Duration) error {
+	return e.sendAID(ctx, pfAIDs[key-1], timeout)
 }
 
 // PA sends a PA key (1-3).
-func (e *Emulator) PA(key int, timeout time.Duration) error {
-	return e.sendAID(paAIDs[key-1], timeout)
+func (e *Emulator) PA(ctx context.Context, key int, timeout time.Duration) error {
+	return e.sendAID(ctx, paAIDs[key-1], timeout)
 }
 
 // Clear clears the screen and sends the Clear AID.
-func (e *Emulator) Clear(timeout time.Duration) error {
+func (e *Emulator) Clear(ctx context.Context, timeout time.Duration) error {
 	e.eraseScreen()
-	return e.sendAID(aidClear, timeout)
+	return e.sendAID(ctx, aidClear, timeout)
 }
 
 // Tab moves the cursor to the next unprotected field.

@@ -9,7 +9,21 @@ import (
 	"time"
 
 	"go.k6.io/k6/js/modules"
+	"go.k6.io/k6/metrics"
 )
+
+// logrusAdapter wraps the k6 VU logger to satisfy the TraceLogger interface.
+type logrusAdapter struct {
+	vu modules.VU
+}
+
+func (l *logrusAdapter) Printf(format string, args ...interface{}) {
+	if state := l.vu.State(); state != nil {
+		state.Logger.Infof(format, args...)
+	} else if initEnv := l.vu.InitEnv(); initEnv != nil {
+		initEnv.Logger.Infof(format, args...)
+	}
+}
 
 type Client struct {
 	vu        modules.VU
@@ -19,11 +33,13 @@ type Client struct {
 	model     int
 	codePage  *CodePage
 	trace     bool
+	metrics   *tn3270Metrics
 }
 
-func NewClient(vu modules.VU) *Client {
+func NewClient(vu modules.VU, m *tn3270Metrics) *Client {
 	return &Client{
-		vu: vu,
+		vu:      vu,
+		metrics: m,
 	}
 }
 
@@ -39,7 +55,29 @@ func (c *Client) newEmulator() *Emulator {
 		emu.codePage = c.codePage
 	}
 	emu.trace = c.trace
+	emu.logger = &logrusAdapter{vu: c.vu}
 	return emu
+}
+
+// pushMetric records a metric sample on the VU's state.
+func (c *Client) pushMetric(metric *metrics.Metric, value float64) {
+	if c.metrics == nil || metric == nil {
+		return
+	}
+	state := c.vu.State()
+	if state == nil {
+		return
+	}
+	ctx := c.vu.Context()
+	now := time.Now()
+	metrics.PushIfNotDone(ctx, state.Samples, metrics.Sample{
+		TimeSeries: metrics.TimeSeries{
+			Metric: metric,
+			Tags:   state.Tags.GetCurrentValues().Tags,
+		},
+		Time:  now,
+		Value: value,
+	})
 }
 
 // SetTrace enables protocol-level debug tracing to stderr.
@@ -82,12 +120,18 @@ func (c *Client) Connect(host string, port int, timeout ...int) error {
 	c.emu = c.newEmulator()
 	c.mu.Unlock()
 
-	if err := c.emu.Connect(host, port, time.Duration(timeoutSec)*time.Second); err != nil {
+	ctx := c.vu.Context()
+	start := time.Now()
+
+	if err := c.emu.Connect(ctx, host, port, time.Duration(timeoutSec)*time.Second); err != nil {
+		c.pushMetric(c.metrics.Errors, 1)
 		c.mu.Lock()
 		c.emu = nil
 		c.mu.Unlock()
 		return fmt.Errorf("failed to connect to %s:%d: %w", host, port, err)
 	}
+
+	c.pushMetric(c.metrics.ConnectDuration, float64(time.Since(start).Milliseconds()))
 
 	c.mu.Lock()
 	c.connected = true
@@ -122,12 +166,18 @@ func (c *Client) ConnectTLS(host string, port int, insecure bool, timeout ...int
 	c.emu.tlsInsecure = insecure
 	c.mu.Unlock()
 
-	if err := c.emu.Connect(host, port, time.Duration(timeoutSec)*time.Second); err != nil {
+	ctx := c.vu.Context()
+	start := time.Now()
+
+	if err := c.emu.Connect(ctx, host, port, time.Duration(timeoutSec)*time.Second); err != nil {
+		c.pushMetric(c.metrics.Errors, 1)
 		c.mu.Lock()
 		c.emu = nil
 		c.mu.Unlock()
 		return fmt.Errorf("failed to connect to %s:%d: %w", host, port, err)
 	}
+
+	c.pushMetric(c.metrics.ConnectDuration, float64(time.Since(start).Milliseconds()))
 
 	c.mu.Lock()
 	c.connected = true
@@ -196,7 +246,15 @@ func (c *Client) Enter() error {
 	if err := c.checkConnected(); err != nil {
 		return err
 	}
-	return c.emu.Enter(30 * time.Second)
+	ctx := c.vu.Context()
+	start := time.Now()
+	if err := c.emu.Enter(ctx, 30*time.Second); err != nil {
+		c.pushMetric(c.metrics.Errors, 1)
+		return err
+	}
+	c.pushMetric(c.metrics.SendDuration, float64(time.Since(start).Milliseconds()))
+	c.pushMetric(c.metrics.Screens, 1)
+	return nil
 }
 
 func (c *Client) Tab() error {
@@ -227,7 +285,15 @@ func (c *Client) Clear() error {
 	if err := c.checkConnected(); err != nil {
 		return err
 	}
-	return c.emu.Clear(30 * time.Second)
+	ctx := c.vu.Context()
+	start := time.Now()
+	if err := c.emu.Clear(ctx, 30*time.Second); err != nil {
+		c.pushMetric(c.metrics.Errors, 1)
+		return err
+	}
+	c.pushMetric(c.metrics.SendDuration, float64(time.Since(start).Milliseconds()))
+	c.pushMetric(c.metrics.Screens, 1)
+	return nil
 }
 
 func (c *Client) Pf(key int) error {
@@ -237,7 +303,15 @@ func (c *Client) Pf(key int) error {
 	if err := c.checkConnected(); err != nil {
 		return err
 	}
-	return c.emu.PF(key, 30*time.Second)
+	ctx := c.vu.Context()
+	start := time.Now()
+	if err := c.emu.PF(ctx, key, 30*time.Second); err != nil {
+		c.pushMetric(c.metrics.Errors, 1)
+		return err
+	}
+	c.pushMetric(c.metrics.SendDuration, float64(time.Since(start).Milliseconds()))
+	c.pushMetric(c.metrics.Screens, 1)
+	return nil
 }
 
 func (c *Client) Pa(key int) error {
@@ -247,7 +321,15 @@ func (c *Client) Pa(key int) error {
 	if err := c.checkConnected(); err != nil {
 		return err
 	}
-	return c.emu.PA(key, 30*time.Second)
+	ctx := c.vu.Context()
+	start := time.Now()
+	if err := c.emu.PA(ctx, key, 30*time.Second); err != nil {
+		c.pushMetric(c.metrics.Errors, 1)
+		return err
+	}
+	c.pushMetric(c.metrics.SendDuration, float64(time.Since(start).Milliseconds()))
+	c.pushMetric(c.metrics.Screens, 1)
+	return nil
 }
 
 func (c *Client) MoveTo(row, col int) error {
@@ -279,7 +361,14 @@ func (c *Client) WaitForField(timeout ...int) error {
 	if len(timeout) > 0 && timeout[0] > 0 {
 		timeoutSec = timeout[0]
 	}
-	return c.emu.WaitForField(time.Duration(timeoutSec) * time.Second)
+	ctx := c.vu.Context()
+	start := time.Now()
+	if err := c.emu.WaitForField(ctx, time.Duration(timeoutSec)*time.Second); err != nil {
+		c.pushMetric(c.metrics.Errors, 1)
+		return err
+	}
+	c.pushMetric(c.metrics.WaitDuration, float64(time.Since(start).Milliseconds()))
+	return nil
 }
 
 func (c *Client) WaitForText(text string, timeout ...int) error {
@@ -298,23 +387,27 @@ func (c *Client) WaitForTextAndReturn(text string, timeout ...int) (string, erro
 	}
 
 	ctx := c.vu.Context()
+	start := time.Now()
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
 
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
+			c.pushMetric(c.metrics.Errors, 1)
 			return "", ctx.Err()
 		default:
 		}
 
 		screen := c.emu.GetScreen()
 		if strings.Contains(screen, text) {
+			c.pushMetric(c.metrics.WaitDuration, float64(time.Since(start).Milliseconds()))
 			return screen, nil
 		}
 
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	c.pushMetric(c.metrics.Errors, 1)
 	return "", fmt.Errorf("timeout waiting for text: %s", text)
 }
 
