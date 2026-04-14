@@ -5,15 +5,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// TraceLogger is the interface used by the Emulator for protocol-level trace output.
 type TraceLogger interface {
 	Printf(format string, args ...interface{})
 }
@@ -247,10 +248,18 @@ type extAttrs struct {
 	ge        bool // True if this position was written via Graphic Escape
 }
 
-// Emulator implements a native TN3270 terminal emulator.
+// Redeclared locally to keep the emulator package free of the k6 lib import;
+// k6's state.Dialer satisfies it structurally.
+type dialContexter interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
 type Emulator struct {
 	conn   net.Conn
 	reader *bufio.Reader
+
+	// nil means dial through a raw net.Dialer (used by unit tests).
+	dialer dialContexter
 
 	// Screen buffer — dynamically allocated based on model/alternate size
 	buffer     []byte     // EBCDIC character data
@@ -294,8 +303,14 @@ type Emulator struct {
 	tn3270eRespHdr   [5]byte // Last received TN3270E header
 
 	// TLS
-	useTLS      bool
-	tlsInsecure bool
+	useTLS           bool
+	tlsInsecure      bool
+	tlsServerName    string
+	tlsMinVersion    uint16
+	tlsRootCAs       *x509.CertPool
+	tlsClientCrts    []tls.Certificate
+	tlsCipherSuites  []uint16
+	tlsBase          *tls.Config // clone target (typically k6 vu state TLSConfig)
 
 	// Code page
 	codePage *CodePage
@@ -303,6 +318,38 @@ type Emulator struct {
 	// Debug tracing
 	trace  bool
 	logger TraceLogger
+
+	// Atomic so concurrent metric readers don't race the I/O goroutines.
+	bytesIn  atomic.Int64
+	bytesOut atomic.Int64
+}
+
+// 0xFE never occurs in a non-display EBCDIC field and stands out in hex dumps.
+const redactByte byte = 0xFE
+
+// 256 KiB is ~70× a model-5 screen but bounds a hostile peer that refuses
+// to send IAC EOR.
+const maxRecordSize = 256 * 1024
+
+func (e *Emulator) BytesIn() int64  { return e.bytesIn.Load() }
+func (e *Emulator) BytesOut() int64 { return e.bytesOut.Load() }
+
+func (e *Emulator) write(p []byte) (int, error) {
+	n, err := e.conn.Write(p)
+	if n > 0 {
+		e.bytesOut.Add(int64(n))
+	}
+	return n, err
+}
+
+// Counting at the reader layer means every byte (including telnet framing) is
+// counted once, regardless of which branch of the telnet handler consumes it.
+func (e *Emulator) readByte() (byte, error) {
+	b, err := e.reader.ReadByte()
+	if err == nil {
+		e.bytesIn.Add(1)
+	}
+	return b, err
 }
 
 func NewEmulator() *Emulator {
@@ -352,32 +399,68 @@ func newEmulatorModel(model int) *Emulator {
 	return e
 }
 
-// Connect establishes a TN3270 connection to the given host and port.
-// Telnet negotiation and initial screen reading happen synchronously.
+// Cloning tlsBase (k6's vu.State().TLSConfig) lets --cacerts, SSLKEYLOGFILE,
+// and runtime cipher policy flow through; per-call options override the clone.
+func (e *Emulator) buildTLSConfig(host string) *tls.Config {
+	var cfg *tls.Config
+	if e.tlsBase != nil {
+		cfg = e.tlsBase.Clone()
+	} else {
+		cfg = &tls.Config{}
+	}
+	cfg.ServerName = host
+	if e.tlsServerName != "" {
+		cfg.ServerName = e.tlsServerName
+	}
+	cfg.InsecureSkipVerify = e.tlsInsecure //#nosec G402 -- user-controlled option for self-signed certs
+	if e.tlsMinVersion != 0 {
+		cfg.MinVersion = e.tlsMinVersion
+	}
+	// Without this, Go's zero MinVersion permits TLS 1.0 / 1.1.
+	if cfg.MinVersion == 0 {
+		cfg.MinVersion = tls.VersionTLS12
+	}
+	if e.tlsRootCAs != nil {
+		cfg.RootCAs = e.tlsRootCAs
+	}
+	if len(e.tlsClientCrts) > 0 {
+		cfg.Certificates = e.tlsClientCrts
+	}
+	if len(e.tlsCipherSuites) > 0 {
+		cfg.CipherSuites = e.tlsCipherSuites
+	}
+	return cfg
+}
+
+// Telnet negotiation and the initial screen read happen synchronously, before return.
 func (e *Emulator) Connect(ctx context.Context, host string, port int, timeout time.Duration) error {
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	var conn net.Conn
-	var err error
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 	defer dialCancel()
 
-	if e.useTLS {
-		tlsConf := &tls.Config{
-			InsecureSkipVerify: e.tlsInsecure, //#nosec G402 -- user-controlled option for self-signed certs
-			ServerName:         host,
-		}
-		dialer := &tls.Dialer{
-			NetDialer: &net.Dialer{},
-			Config:    tlsConf,
-		}
-		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
+	var dialer dialContexter
+	if e.dialer != nil {
+		dialer = e.dialer
 	} else {
-		dialer := &net.Dialer{}
-		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
+		dialer = &net.Dialer{}
 	}
+
+	rawConn, err := dialer.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("tcp connection failed: %w", err)
+	}
+
+	conn := rawConn
+	if e.useTLS {
+		// Dial first via the k6 dialer (so blocked-hostname policy applies
+		// even to TLS), then layer TLS. Handshake uses the dial deadline.
+		tlsConn := tls.Client(rawConn, e.buildTLSConfig(host))
+		if err := tlsConn.HandshakeContext(dialCtx); err != nil {
+			_ = rawConn.Close()
+			return fmt.Errorf("tls handshake failed: %w", err)
+		}
+		conn = tlsConn
 	}
 
 	e.conn = conn
@@ -426,7 +509,6 @@ func (e *Emulator) handshake(ctx context.Context, timeout time.Duration) error {
 	return nil
 }
 
-// closeConn closes and nils the connection, ignoring close errors.
 func (e *Emulator) closeConn() {
 	if e.conn != nil {
 		_ = e.conn.Close()
@@ -435,12 +517,38 @@ func (e *Emulator) closeConn() {
 	e.connState = connNotConnected
 }
 
-// Disconnect closes the TN3270 connection.
+// Wipes the screen buffer so credentials don't sit in process memory waiting
+// for Go's GC after the session ends.
 func (e *Emulator) Disconnect() {
 	e.closeConn()
+	e.wipeBuffers()
 }
 
-// IsConnected returns true if the emulator has an active connection.
+func (e *Emulator) wipeBuffers() {
+	for i := range e.buffer {
+		e.buffer[i] = 0
+	}
+	for i := range e.fieldAttrs {
+		e.fieldAttrs[i] = 0
+	}
+	for i := range e.isAttr {
+		e.isAttr[i] = false
+	}
+	for i := range e.extFields {
+		e.extFields[i] = extAttrs{}
+	}
+	e.cursorAddr = 0
+	e.bufAddr = 0
+	e.lastAID = 0
+	e.keyboardLock = true
+	e.replyMode = replyModeField
+	e.replyModeAttr = nil
+	e.tn3270e = false
+	e.tn3270eResponses = false
+	e.seqNum = 0
+	e.tn3270eRespHdr = [5]byte{}
+}
+
 func (e *Emulator) IsConnected() bool {
 	return e.conn != nil && e.connState >= connTN3270
 }
@@ -452,13 +560,16 @@ func (e *Emulator) IsConnected() bool {
 func (e *Emulator) readMessage() ([]byte, error) {
 	var data []byte
 	for {
-		b, err := e.reader.ReadByte()
+		b, err := e.readByte()
 		if err != nil {
 			return nil, err
 		}
+		if len(data) >= maxRecordSize {
+			return nil, fmt.Errorf("record exceeds maximum size of %d bytes", maxRecordSize)
+		}
 
 		if b == telnetIAC {
-			next, err := e.reader.ReadByte()
+			next, err := e.readByte()
 			if err != nil {
 				return nil, err
 			}
@@ -514,7 +625,7 @@ func (e *Emulator) readMessage() ([]byte, error) {
 				}
 				return data, nil // End of record
 			case telnetDO:
-				opt, err := e.reader.ReadByte()
+				opt, err := e.readByte()
 				if err != nil {
 					return nil, err
 				}
@@ -522,7 +633,7 @@ func (e *Emulator) readMessage() ([]byte, error) {
 					return nil, err
 				}
 			case telnetDONT:
-				opt, err := e.reader.ReadByte()
+				opt, err := e.readByte()
 				if err != nil {
 					return nil, err
 				}
@@ -530,7 +641,7 @@ func (e *Emulator) readMessage() ([]byte, error) {
 					return nil, err
 				}
 			case telnetWILL:
-				opt, err := e.reader.ReadByte()
+				opt, err := e.readByte()
 				if err != nil {
 					return nil, err
 				}
@@ -538,7 +649,7 @@ func (e *Emulator) readMessage() ([]byte, error) {
 					return nil, err
 				}
 			case telnetWONT:
-				opt, err := e.reader.ReadByte()
+				opt, err := e.readByte()
 				if err != nil {
 					return nil, err
 				}
@@ -620,14 +731,20 @@ func (e *Emulator) handleTelnetWill(opt byte) error {
 }
 
 func (e *Emulator) handleSubnegotiation() error {
+	// Real telnet subnegotiations are tens of bytes; cap defends against a
+	// server that streams without IAC SE.
+	const maxSubnegBytes = 4 * 1024
 	var subData []byte
 	for {
-		b, err := e.reader.ReadByte()
+		b, err := e.readByte()
 		if err != nil {
 			return err
 		}
+		if len(subData) >= maxSubnegBytes {
+			return fmt.Errorf("subnegotiation exceeds maximum size of %d bytes", maxSubnegBytes)
+		}
 		if b == telnetIAC {
-			next, err := e.reader.ReadByte()
+			next, err := e.readByte()
 			if err != nil {
 				return err
 			}
@@ -650,7 +767,7 @@ func (e *Emulator) handleSubnegotiation() error {
 		resp := []byte{telnetIAC, telnetSB, telnetOptTermType, telnetTermTypeIs}
 		resp = append(resp, []byte(tm.name)...)
 		resp = append(resp, telnetIAC, telnetSE)
-		_, err := e.conn.Write(resp)
+		_, err := e.write(resp)
 		return err
 	}
 
@@ -680,7 +797,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eDeviceType, tn3270eRequest}
 			resp = append(resp, []byte(tm.name)...)
 			resp = append(resp, telnetIAC, telnetSE)
-			_, err := e.conn.Write(resp)
+			_, err := e.write(resp)
 			return err
 		}
 
@@ -699,7 +816,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eRequest,
 				tn3270eFuncResponses,
 				telnetIAC, telnetSE}
-			_, err := e.conn.Write(resp)
+			_, err := e.write(resp)
 			return err
 		case 0x06: // REJECT
 			// Server rejected our device type or TN3270E entirely.
@@ -746,7 +863,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 			resp := []byte{telnetIAC, telnetSB, telnetOptTN3270E, tn3270eFunctions, tn3270eIs}
 			resp = append(resp, accepted...)
 			resp = append(resp, telnetIAC, telnetSE)
-			if _, err := e.conn.Write(resp); err != nil {
+			if _, err := e.write(resp); err != nil {
 				return err
 			}
 			e.tn3270e = true
@@ -765,7 +882,7 @@ func (e *Emulator) handleTN3270ESub(data []byte) error {
 }
 
 func (e *Emulator) sendTelnet(data ...byte) error {
-	_, err := e.conn.Write(data)
+	_, err := e.write(data)
 	return err
 }
 
@@ -780,7 +897,7 @@ func (e *Emulator) sendRecord(data []byte) error {
 	}
 	buf.WriteByte(telnetIAC)
 	buf.WriteByte(telnetEOR)
-	_, err := e.conn.Write(buf.Bytes())
+	_, err := e.write(buf.Bytes())
 	return err
 }
 
@@ -797,10 +914,11 @@ func (e *Emulator) sendData(data []byte) error {
 		case aidSF:
 			aidName = "SF(QueryReply)"
 		}
-		if len(data) <= 256 {
-			e.logf("[3270] SEND aid=%s len=%d data=%s", aidName, len(data), hex.EncodeToString(data))
+		redacted := e.redactOutbound(data)
+		if len(redacted) <= 256 {
+			e.logf("[3270] SEND aid=%s len=%d data=%s", aidName, len(data), hex.EncodeToString(redacted))
 		} else {
-			e.logf("[3270] SEND aid=%s len=%d data=%s... (%d bytes)", aidName, len(data), hex.EncodeToString(data[:256]), len(data))
+			e.logf("[3270] SEND aid=%s len=%d data=%s... (%d bytes)", aidName, len(data), hex.EncodeToString(redacted[:256]), len(data))
 		}
 	}
 	if e.tn3270e {
@@ -812,6 +930,102 @@ func (e *Emulator) sendData(data []byte) error {
 		return e.sendRecord(record)
 	}
 	return e.sendRecord(data)
+}
+
+// Walks the record as the host would (AID + cursor + orders + data) and masks
+// any data byte landing in a non-display field. On a malformed/truncated order
+// the remainder of the record is masked rather than risk leaking cleartext.
+func (e *Emulator) redactOutbound(data []byte) []byte {
+	out := make([]byte, len(data))
+	copy(out, data)
+	if e.size == 0 || len(data) == 0 {
+		return out
+	}
+	// Query replies describe terminal capability; no user data to mask.
+	if data[0] == aidSF {
+		return out
+	}
+	// Skip AID + 2-byte cursor address.
+	i := 3
+	if i > len(data) {
+		return out
+	}
+	bufAddr := 0
+	redactTail := func(from int) {
+		for j := from; j < len(out); j++ {
+			out[j] = redactByte
+		}
+	}
+	advance := func() {
+		if e.isFieldNonDisplay(bufAddr) {
+			out[i] = redactByte
+		}
+		bufAddr = (bufAddr + 1) % e.size
+		i++
+	}
+	for i < len(data) {
+		switch data[i] {
+		case orderSBA:
+			if i+2 >= len(data) {
+				redactTail(i)
+				return out
+			}
+			bufAddr = decodeAddr(data[i+1], data[i+2])
+			if bufAddr < 0 || bufAddr >= e.size {
+				bufAddr = 0
+			}
+			i += 3
+		case orderSF:
+			if i+1 >= len(data) {
+				redactTail(i)
+				return out
+			}
+			i += 2
+		case orderSFE:
+			if i+1 >= len(data) {
+				redactTail(i)
+				return out
+			}
+			n := int(data[i+1])
+			skip := 2 + 2*n
+			if i+skip > len(data) {
+				redactTail(i)
+				return out
+			}
+			i += skip
+		case orderSA, orderMF:
+			if i+2 >= len(data) {
+				redactTail(i)
+				return out
+			}
+			i += 3
+		case orderIC, orderPT:
+			i++
+		case orderRA:
+			if i+3 >= len(data) {
+				redactTail(i)
+				return out
+			}
+			i += 4
+		case orderEUA:
+			if i+2 >= len(data) {
+				redactTail(i)
+				return out
+			}
+			i += 3
+		case orderGE:
+			if i+1 >= len(data) {
+				redactTail(i)
+				return out
+			}
+			// GE escape: the following byte is data, placed at bufAddr.
+			i++
+			advance()
+		default:
+			advance()
+		}
+	}
+	return out
 }
 
 // sendTN3270EPositiveResponse sends a TN3270E positive response for the
