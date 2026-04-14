@@ -9,15 +9,21 @@ Native Go implementation of RFC 1576 (TN3270) and RFC 2355 (TN3270E) — no exte
 
 ## Install
 
+The native Go implementation lives on the `native` branch (tagged `v0.1.0`)
+while it's in pilot. `main` still carries the older `s3270`-subprocess version.
+Pin explicitly:
+
 ```bash
 go install go.k6.io/xk6/cmd/xk6@latest
-xk6 build --with github.com/msradam/xk6-tn3270
+xk6 build --with github.com/msradam/xk6-tn3270@v0.1.0
+# or track the branch:
+xk6 build --with github.com/msradam/xk6-tn3270@native
 ```
 
 For local development:
 
 ```bash
-git clone https://github.com/msradam/xk6-tn3270.git
+git clone -b native https://github.com/msradam/xk6-tn3270.git
 cd xk6-tn3270
 make build
 ```
