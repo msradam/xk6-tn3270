@@ -20,6 +20,7 @@ const (
 	CodeInitContext      = "init_context"
 	CodeProtectedField   = "protected_field"
 	CodeScreenshotFailed = "screenshot_failed"
+	CodeTextNotFound     = "text_not_found"
 )
 
 type Tn3270Error struct {

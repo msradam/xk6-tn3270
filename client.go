@@ -882,3 +882,242 @@ func (c *Client) PrintScreen() (string, error) {
 	result.WriteString("└" + strings.Repeat("─", 82) + "┘")
 	return result.String(), nil
 }
+
+// WaitForKeyboard waits until the host unlocks the keyboard.
+// Unlike WaitForField, this succeeds as soon as the keyboard is unlocked,
+// without requiring an unprotected input field to be present.
+func (c *Client) WaitForKeyboard(timeout ...int) error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	timeoutSec := 30
+	if len(timeout) > 0 && timeout[0] > 0 {
+		timeoutSec = timeout[0]
+	}
+	ctx := c.vu.Context()
+	start := time.Now()
+	if err := c.emu.WaitForKeyboard(ctx, time.Duration(timeoutSec)*time.Second); err != nil {
+		c.flushBytes()
+		c.pushMetric(c.metrics.Errors, 1)
+		if strings.Contains(err.Error(), "timeout") {
+			c.pushMetric(c.metrics.WaitTimeouts, 1)
+			return wrapError(CodeWaitTimeout, "timeout waiting for keyboard unlock", err)
+		}
+		return wrapError(CodeProtocol, "waitForKeyboard failed", err)
+	}
+	c.pushMetric(c.metrics.WaitDuration, float64(time.Since(start).Milliseconds()))
+	c.flushBytes()
+	return nil
+}
+
+// Wfk is the Galasa-style alias for WaitForKeyboard.
+func (c *Client) Wfk(timeout ...int) error {
+	return c.WaitForKeyboard(timeout...)
+}
+
+// EraseEOF erases from the cursor to the end of the current unprotected field.
+func (c *Client) EraseEOF() error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.EraseEOF()
+	return nil
+}
+
+// EraseInput erases the entire content of the unprotected field at the cursor
+// and moves the cursor to the start of that field.
+func (c *Client) EraseInput() error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.EraseInput()
+	return nil
+}
+
+// BackSpace moves the cursor back one position within the current field and
+// erases the character at that position.
+func (c *Client) BackSpace() error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.BackSpace()
+	return nil
+}
+
+// CursorUp moves the cursor up one row.
+func (c *Client) CursorUp() error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.CursorUp()
+	return nil
+}
+
+// CursorDown moves the cursor down one row.
+func (c *Client) CursorDown() error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.CursorDown()
+	return nil
+}
+
+// CursorLeft moves the cursor left one position.
+func (c *Client) CursorLeft() error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.CursorLeft()
+	return nil
+}
+
+// CursorRight moves the cursor right one position.
+func (c *Client) CursorRight() error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.CursorRight()
+	return nil
+}
+
+// NewLine moves the cursor to the first unprotected field on the next row.
+func (c *Client) NewLine() error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	c.emu.NewLine()
+	return nil
+}
+
+// PositionCursorToFieldContaining moves the cursor to the start of the first
+// field (protected or unprotected) whose text contains the given string.
+// Use Tab() afterwards to move from a label field into the adjacent input field.
+func (c *Client) PositionCursorToFieldContaining(text string) error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	pos := c.emu.FindFieldWithText(text)
+	if pos < 0 {
+		return newError(CodeTextNotFound, fmt.Sprintf("no field found containing: %q", text))
+	}
+	c.emu.cursorAddr = pos
+	return nil
+}
+
+// RetrieveFieldAtCursor returns the decoded text of the field at the current
+// cursor position. Trailing spaces are stripped.
+func (c *Client) RetrieveFieldAtCursor() (string, error) {
+	if err := c.checkConnected(); err != nil {
+		return "", err
+	}
+	return c.emu.GetFieldText(c.emu.cursorAddr), nil
+}
+
+// RetrieveFieldTextAfterFieldWithString returns the decoded text of the field
+// immediately following the first field whose text contains the given string.
+// This is the Galasa pattern for reading a value from the field adjacent to a label.
+func (c *Client) RetrieveFieldTextAfterFieldWithString(text string) (string, error) {
+	if err := c.checkConnected(); err != nil {
+		return "", err
+	}
+	pos := c.emu.FindFieldWithText(text)
+	if pos < 0 {
+		return "", newError(CodeTextNotFound, fmt.Sprintf("no field found containing: %q", text))
+	}
+	nextPos := c.emu.NextFieldStart(pos)
+	if nextPos < 0 {
+		return "", newError(CodeTextNotFound, fmt.Sprintf("no field follows the field containing: %q", text))
+	}
+	return c.emu.GetFieldText(nextPos), nil
+}
+
+// RetrieveText returns length characters starting at the given 1-based row and column.
+func (c *Client) RetrieveText(row, col, length int) (string, error) {
+	if err := c.checkConnected(); err != nil {
+		return "", err
+	}
+	if row < 1 || row > c.emu.rows {
+		return "", newError(CodeInvalidArgument, fmt.Sprintf("row must be between 1 and %d, got %d", c.emu.rows, row))
+	}
+	if col < 1 || col > c.emu.cols {
+		return "", newError(CodeInvalidArgument, fmt.Sprintf("column must be between 1 and %d, got %d", c.emu.cols, col))
+	}
+	if length < 1 {
+		return "", newError(CodeInvalidArgument, fmt.Sprintf("length must be at least 1, got %d", length))
+	}
+	pos := (row-1)*c.emu.cols + (col - 1)
+	return c.emu.GetTextAt(pos, length), nil
+}
+
+// RetrieveTextAtCursor returns length characters starting at the current cursor position.
+func (c *Client) RetrieveTextAtCursor(length int) (string, error) {
+	if err := c.checkConnected(); err != nil {
+		return "", err
+	}
+	if length < 1 {
+		return "", newError(CodeInvalidArgument, fmt.Sprintf("length must be at least 1, got %d", length))
+	}
+	return c.emu.GetTextAt(c.emu.cursorAddr, length), nil
+}
+
+// WaitForAnyText blocks until one of the ok strings appears on screen.
+// If any of the errStrings appears first, an error is returned immediately.
+// Returns the 0-based index of the matched ok string.
+// Equivalent to Galasa's waitForTextInField(String[] ok, String[] error, long timeout).
+func (c *Client) WaitForAnyText(ok []string, errStrings []string, timeout ...int) (int, error) {
+	if err := c.checkConnected(); err != nil {
+		return -1, err
+	}
+	timeoutSec := 30
+	if len(timeout) > 0 && timeout[0] > 0 {
+		timeoutSec = timeout[0]
+	}
+	ctx := c.vu.Context()
+	start := time.Now()
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			c.pushMetric(c.metrics.Errors, 1)
+			return -1, wrapError(CodeProtocol, "context cancelled", ctx.Err())
+		default:
+		}
+		screen := c.emu.GetScreen()
+		for _, s := range errStrings {
+			if strings.Contains(screen, s) {
+				c.pushMetric(c.metrics.Errors, 1)
+				return -1, newError(CodeTextNotFound, fmt.Sprintf("error text found on screen: %q", s))
+			}
+		}
+		for i, s := range ok {
+			if strings.Contains(screen, s) {
+				c.pushMetric(c.metrics.WaitDuration, float64(time.Since(start).Milliseconds()))
+				return i, nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	c.pushMetric(c.metrics.Errors, 1)
+	c.pushMetric(c.metrics.WaitTimeouts, 1)
+	return -1, newError(CodeWaitTimeout, "timeout waiting for text")
+}
+
+// VerifyTextInField returns an error if the given text is not currently visible on screen.
+// Equivalent to Galasa's verifyTextInField(String).
+func (c *Client) VerifyTextInField(text string) error {
+	if err := c.checkConnected(); err != nil {
+		return err
+	}
+	if !strings.Contains(c.emu.GetScreen(), text) {
+		return newError(CodeTextNotFound, fmt.Sprintf("text not found on screen: %q", text))
+	}
+	return nil
+}
+
+// IsClearScreen returns true if the screen contains no visible characters.
+func (c *Client) IsClearScreen() (bool, error) {
+	if err := c.checkConnected(); err != nil {
+		return false, err
+	}
+	return c.emu.IsClearScreen(), nil
+}

@@ -303,14 +303,14 @@ type Emulator struct {
 	tn3270eRespHdr   [5]byte // Last received TN3270E header
 
 	// TLS
-	useTLS           bool
-	tlsInsecure      bool
-	tlsServerName    string
-	tlsMinVersion    uint16
-	tlsRootCAs       *x509.CertPool
-	tlsClientCrts    []tls.Certificate
-	tlsCipherSuites  []uint16
-	tlsBase          *tls.Config // clone target (typically k6 vu state TLSConfig)
+	useTLS          bool
+	tlsInsecure     bool
+	tlsServerName   string
+	tlsMinVersion   uint16
+	tlsRootCAs      *x509.CertPool
+	tlsClientCrts   []tls.Certificate
+	tlsCipherSuites []uint16
+	tlsBase         *tls.Config // clone target (typically k6 vu state TLSConfig)
 
 	// Code page
 	codePage *CodePage
@@ -2219,4 +2219,269 @@ func (e *Emulator) Home() {
 // MoveCursor sets the cursor to the given position (0-based row and col).
 func (e *Emulator) MoveCursor(row, col int) {
 	e.cursorAddr = row*e.cols + col
+}
+
+// WaitForKeyboard waits until the host unlocks the keyboard.
+// Unlike WaitForField, it does not require an unprotected input field to be present.
+func (e *Emulator) WaitForKeyboard(ctx context.Context, timeout time.Duration) error {
+	if !e.keyboardLock {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if err := e.conn.SetReadDeadline(time.Now().Add(min(remaining, 500*time.Millisecond))); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
+		msg, err := e.readMessage()
+		_ = e.conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return err
+		}
+		if err := e.processAndRespond(msg); err != nil {
+			return err
+		}
+		if !e.keyboardLock {
+			return nil
+		}
+	}
+	return fmt.Errorf("timeout waiting for keyboard unlock")
+}
+
+// EraseEOF erases from the cursor position to the end of the current field
+// (or to the end of the screen buffer on an unformatted screen).
+func (e *Emulator) EraseEOF() {
+	if e.isAttr[e.cursorAddr] || e.isFieldProtectedAt(e.cursorAddr) {
+		return
+	}
+	for pos := e.cursorAddr; pos < e.size; pos++ {
+		if e.isAttr[pos] {
+			break
+		}
+		e.buffer[pos] = 0x00
+	}
+	e.setMDT(e.cursorAddr)
+}
+
+// EraseInput erases the entire content of the unprotected field at the cursor
+// and moves the cursor to the start of that field.
+func (e *Emulator) EraseInput() {
+	if e.isFieldProtectedAt(e.cursorAddr) {
+		return
+	}
+	attrPos := e.findFieldAttr(e.cursorAddr)
+	if attrPos < 0 {
+		return
+	}
+	start := (attrPos + 1) % e.size
+	pos := start
+	for {
+		if !e.isAttr[pos] {
+			e.buffer[pos] = 0x00
+		}
+		next := (pos + 1) % e.size
+		if e.isAttr[next] || next == start {
+			break
+		}
+		pos = next
+	}
+	e.fieldAttrs[attrPos] &^= attrMDT
+	e.cursorAddr = start
+}
+
+// BackSpace moves the cursor back one position within the current field and
+// erases the character at that position.
+func (e *Emulator) BackSpace() {
+	if e.isFieldProtectedAt(e.cursorAddr) {
+		return
+	}
+	attrPos := e.findFieldAttr(e.cursorAddr)
+	fieldStart := 0
+	if attrPos >= 0 {
+		fieldStart = (attrPos + 1) % e.size
+	}
+	if e.cursorAddr == fieldStart {
+		return
+	}
+	prev := (e.cursorAddr - 1 + e.size) % e.size
+	if e.isAttr[prev] {
+		return
+	}
+	e.cursorAddr = prev
+	e.buffer[e.cursorAddr] = 0x00
+	e.setMDT(e.cursorAddr)
+}
+
+// CursorUp moves the cursor up one row, wrapping to the last row at the top.
+func (e *Emulator) CursorUp() {
+	row := e.cursorAddr / e.cols
+	col := e.cursorAddr % e.cols
+	if row == 0 {
+		row = e.rows - 1
+	} else {
+		row--
+	}
+	e.cursorAddr = row*e.cols + col
+}
+
+// CursorDown moves the cursor down one row, wrapping to the first row at the bottom.
+func (e *Emulator) CursorDown() {
+	row := e.cursorAddr / e.cols
+	col := e.cursorAddr % e.cols
+	if row == e.rows-1 {
+		row = 0
+	} else {
+		row++
+	}
+	e.cursorAddr = row*e.cols + col
+}
+
+// CursorLeft moves the cursor left one position, wrapping to the previous row.
+func (e *Emulator) CursorLeft() {
+	e.cursorAddr = (e.cursorAddr - 1 + e.size) % e.size
+}
+
+// CursorRight moves the cursor right one position, wrapping to the next row.
+func (e *Emulator) CursorRight() {
+	e.cursorAddr = (e.cursorAddr + 1) % e.size
+}
+
+// NewLine moves the cursor to the first unprotected field on the next row.
+func (e *Emulator) NewLine() {
+	nextRow := (e.cursorAddr/e.cols + 1) % e.rows
+	startOfRow := nextRow * e.cols
+	if !e.isFormatted() {
+		e.cursorAddr = startOfRow
+		return
+	}
+	p := startOfRow
+	for i := 0; i < e.size; i++ {
+		if e.isAttr[p] && e.fieldAttrs[p]&attrProtected == 0 {
+			e.cursorAddr = (p + 1) % e.size
+			return
+		}
+		p = (p + 1) % e.size
+	}
+	e.cursorAddr = startOfRow
+}
+
+// GetFieldText returns the decoded text of the field containing pos.
+// Trailing spaces are stripped. Returns empty string for non-display fields.
+func (e *Emulator) GetFieldText(pos int) string {
+	e2a := &ebcdicToASCII
+	if e.codePage != nil {
+		e2a = &e.codePage.EBCDICToASCII
+	}
+	if !e.isFormatted() {
+		return strings.TrimRight(e.GetScreen(), " ")
+	}
+	attrPos := e.findFieldAttr(pos)
+	if attrPos < 0 {
+		return ""
+	}
+	if e.isFieldNonDisplay(pos) {
+		return ""
+	}
+	start := (attrPos + 1) % e.size
+	var buf strings.Builder
+	cur := start
+	for {
+		if e.isAttr[cur] {
+			break
+		}
+		ch := e.buffer[cur]
+		if ch == 0x00 {
+			buf.WriteByte(' ')
+		} else {
+			a := e2a[ch]
+			if a == 0x00 {
+				buf.WriteByte(' ')
+			} else {
+				buf.WriteByte(a)
+			}
+		}
+		cur = (cur + 1) % e.size
+		if cur == start {
+			break
+		}
+	}
+	return strings.TrimRight(buf.String(), " ")
+}
+
+// FindFieldWithText returns the data-start position of the first field whose
+// decoded text contains the given string. Returns -1 if not found.
+func (e *Emulator) FindFieldWithText(text string) int {
+	for i := 0; i < e.size; i++ {
+		if !e.isAttr[i] {
+			continue
+		}
+		dataStart := (i + 1) % e.size
+		if strings.Contains(e.GetFieldText(dataStart), text) {
+			return dataStart
+		}
+	}
+	return -1
+}
+
+// NextFieldStart returns the data-start position of the field immediately
+// following the field that contains pos. Returns -1 if there is no next field.
+func (e *Emulator) NextFieldStart(pos int) int {
+	attrPos := e.findFieldAttr(pos)
+	if attrPos < 0 {
+		return -1
+	}
+	p := (attrPos + 1) % e.size
+	for i := 0; i < e.size-1; i++ {
+		if e.isAttr[p] {
+			return (p + 1) % e.size
+		}
+		p = (p + 1) % e.size
+	}
+	return -1
+}
+
+// GetTextAt returns length characters starting at buffer position pos,
+// decoded from EBCDIC. Attribute positions and non-display positions render as space.
+func (e *Emulator) GetTextAt(pos, length int) string {
+	e2a := &ebcdicToASCII
+	if e.codePage != nil {
+		e2a = &e.codePage.EBCDICToASCII
+	}
+	var buf strings.Builder
+	buf.Grow(length)
+	for i := 0; i < length; i++ {
+		p := (pos + i) % e.size
+		if e.isAttr[p] || e.isFieldNonDisplay(p) {
+			buf.WriteByte(' ')
+			continue
+		}
+		ch := e.buffer[p]
+		if ch == 0x00 {
+			buf.WriteByte(' ')
+		} else {
+			a := e2a[ch]
+			if a == 0x00 {
+				buf.WriteByte(' ')
+			} else {
+				buf.WriteByte(a)
+			}
+		}
+	}
+	return buf.String()
+}
+
+// IsClearScreen returns true if the screen contains no visible characters.
+func (e *Emulator) IsClearScreen() bool {
+	return strings.TrimSpace(e.GetScreen()) == ""
 }

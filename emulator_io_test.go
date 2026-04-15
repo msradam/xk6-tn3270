@@ -182,4 +182,4 @@ func TestClassifyConnectError(t *testing.T) {
 type stringErr string
 
 func (s stringErr) Error() string { return string(s) }
-func errorWithMsg(m string) error  { return stringErr(m) }
+func errorWithMsg(m string) error { return stringErr(m) }
